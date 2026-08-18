@@ -105,7 +105,7 @@ function normalizeAttributes(attributes) {
 module.exports.getProducts = async (req, res) => {
   try {
     const { storeId, updatedSince } = req.query;
-
+console.log(storeId)
     if (!storeId) {
       return res.status(400).json({ success: false, message: "storeId is required" });
     }
