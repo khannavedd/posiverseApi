@@ -142,13 +142,21 @@ console.log(storeId)
 
 // A style's detail + its variant children (empty array if the style has
 // no Attributes, since the anchor row is the only SKU in that case).
+// storeId (query param, optional) brings in each row's real InStockQty
+// via the same LEFT JOIN getProducts already uses — omitted/unmatched
+// rows just default to 0 via COALESCE, same as the list endpoint.
 module.exports.getProduct = async (req, res) => {
   try {
     const { id } = req.params;
+    const { storeId } = req.query;
 
     const result = await pool.query(
-      `SELECT * FROM "Product" WHERE "RegistrationID" = $1 AND ("ProductID" = $2 OR "ParentProductID" = $2) ORDER BY "CreatedAt" ASC`,
-      [req.user.RegistrationID, id]
+      `SELECT p.*, COALESCE(i."InStockQty", 0) AS "InStockQty"
+       FROM "Product" p
+       LEFT JOIN "InStock" i ON i."ProductID" = p."ProductID" AND i."StoreID" = $3
+       WHERE p."RegistrationID" = $1 AND (p."ProductID" = $2 OR p."ParentProductID" = $2)
+       ORDER BY p."CreatedAt" ASC`,
+      [req.user.RegistrationID, id, storeId || null]
     );
 
     const product = result.rows.find(r => r.ProductID === id);
@@ -204,6 +212,7 @@ module.exports.createProduct = async (req, res) => {
       mrp,
       sellingPrice,
       taxId,
+      taxInclusive,
       unit,
       entries,
     } = req.body;
@@ -279,8 +288,8 @@ module.exports.createProduct = async (req, res) => {
         ("ProductID", "RegistrationID", "StoreID", "IsShared", "ProductType", "ParentProductID",
          "InventoryType", "Attributes", "AutoGenerateSku", "SKU", "Barcode",
          "CategoryID", "BrandID",
-         "Name", "Unit", "CostPrice", "SellingPrice", "MRP", "TaxID", "IsActive")
-       VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,true)
+         "Name", "Unit", "CostPrice", "SellingPrice", "MRP", "TaxID", "TaxInclusive", "IsActive")
+       VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true)
        RETURNING *`,
       [
         anchorId,
@@ -301,6 +310,7 @@ module.exports.createProduct = async (req, res) => {
         sellingPriceNum,
         mrpNum,
         taxId ?? null,
+        !!taxInclusive,
       ]
     );
 
@@ -334,8 +344,8 @@ module.exports.createProduct = async (req, res) => {
              "InventoryType", "VariantAttributes", "VariantName",
              "SKU", "Barcode",
              "CategoryID", "BrandID",
-             "Name", "Unit", "CostPrice", "SellingPrice", "MRP", "TaxID", "IsActive")
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true)
+             "Name", "Unit", "CostPrice", "SellingPrice", "MRP", "TaxID", "TaxInclusive", "IsActive")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,true)
            RETURNING *`,
           [
             crypto.randomUUID(),
@@ -357,6 +367,7 @@ module.exports.createProduct = async (req, res) => {
             variantSellingPrice,
             variantMrp,
             taxId ?? null,
+            !!taxInclusive,
           ]
         );
         createdVariants.push(variantResult.rows[0]);
@@ -402,6 +413,7 @@ module.exports.updateProduct = async (req, res) => {
       mrp,
       sellingPrice,
       taxId,
+      taxInclusive,
       isShared,
       newEntries,
     } = req.body;
@@ -457,6 +469,9 @@ module.exports.updateProduct = async (req, res) => {
 
     const finalProductType = ["goods", "service"].includes(productType) ? productType : existing.ProductType;
 
+    const finalTaxId = taxId ?? existing.TaxID;
+    const finalTaxInclusive = taxInclusive !== undefined ? !!taxInclusive : existing.TaxInclusive;
+
     const result = await client.query(
       `UPDATE "Product" SET
         "Name" = COALESCE($1, "Name"),
@@ -469,9 +484,10 @@ module.exports.updateProduct = async (req, res) => {
         "MRP" = $8,
         "SellingPrice" = COALESCE($9, "SellingPrice"),
         "TaxID" = $10,
-        "IsShared" = COALESCE($11, "IsShared"),
+        "TaxInclusive" = $11,
+        "IsShared" = COALESCE($12, "IsShared"),
         "UpdatedAt" = now()
-       WHERE "ProductID" = $12
+       WHERE "ProductID" = $13
        RETURNING *`,
       [
         name ?? null,
@@ -483,12 +499,31 @@ module.exports.updateProduct = async (req, res) => {
         toNullableNumber(costPrice) ?? existing.CostPrice,
         toNullableNumber(mrp) ?? existing.MRP,
         sellingPrice !== undefined && sellingPrice !== null ? Number(sellingPrice) : null,
-        taxId ?? existing.TaxID,
+        finalTaxId,
+        finalTaxInclusive,
         isShared ?? null,
         id,
       ]
     );
     const updated = result.rows[0];
+
+    // Tax is a style-wide setting (one Tax dropdown on the Basics form,
+    // not a per-variant field) — createProduct already applies it to
+    // every variant it creates at once. Existing variants, created
+    // before this edit, were never touched by the UPDATE above (it only
+    // targets this anchor row's own ProductID), so without this they'd
+    // keep whatever TaxID/TaxInclusive they had at creation time —
+    // which is exactly the bug where mapping a Tax onto an existing
+    // variant product doesn't carry through to Purchase Entry, since
+    // Purchase Entry always references a variant's own ProductID, not
+    // the anchor's.
+    if (finalTaxId !== existing.TaxID || finalTaxInclusive !== existing.TaxInclusive) {
+      await client.query(
+        `UPDATE "Product" SET "TaxID" = $1, "TaxInclusive" = $2, "UpdatedAt" = now()
+         WHERE "ParentProductID" = $3 AND "IsActive" = true`,
+        [finalTaxId, finalTaxInclusive, id]
+      );
+    }
 
     const addedVariants = [];
     let attributesChanged = false;
@@ -554,8 +589,8 @@ module.exports.updateProduct = async (req, res) => {
              "InventoryType", "VariantAttributes", "VariantName",
              "SKU", "Barcode",
              "CategoryID", "BrandID",
-             "Name", "Unit", "CostPrice", "SellingPrice", "MRP", "TaxID", "IsActive")
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,true)
+             "Name", "Unit", "CostPrice", "SellingPrice", "MRP", "TaxID", "TaxInclusive", "IsActive")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,true)
            RETURNING *`,
           [
             crypto.randomUUID(),
@@ -577,6 +612,7 @@ module.exports.updateProduct = async (req, res) => {
             variantSellingPrice,
             variantMrp,
             updated.TaxID,
+            updated.TaxInclusive,
           ]
         );
         addedVariants.push(variantResult.rows[0]);
