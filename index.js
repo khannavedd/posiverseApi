@@ -33,6 +33,7 @@ test();
  const PurchaseRoutes = require("./Routes/Purchase");
  const TransactionTypeRoutes = require("./Routes/TransactionType");
  const PaymentTypeRoutes = require("./Routes/PaymentType");
+ const PrintTemplateRoutes = require("./Routes/PrintTemplate");
 
 const PORT = process.env.PORT || 8080;
 
@@ -59,6 +60,7 @@ app.use(
  app.use("/purchases", PurchaseRoutes);
  app.use("/transaction-types", TransactionTypeRoutes);
  app.use("/payment-types", PaymentTypeRoutes);
+ app.use("/print-templates", PrintTemplateRoutes);
  // POST /register — the onboarding website lives in its own separate
  // project and calls this over plain HTTP (CORS is wide open above),
  // not served from here.

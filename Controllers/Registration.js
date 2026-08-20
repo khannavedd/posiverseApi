@@ -87,6 +87,9 @@ const OWNER_PERMISSIONS = [
   "paymenttype.create",
   "paymenttype.edit",
   "paymenttype.delete",
+
+  "printtemplate.view",
+  "printtemplate.edit",
 ];
 
 // Registration/User/Store use bigint "ActionOn" columns rather than
@@ -230,6 +233,40 @@ module.exports.register = async (req, res) => {
       `INSERT INTO "CashRegister" ("CashRegisterID", "StoreID", "Code", "Name", "IsActive")
        VALUES ($1, $2, '01', 'Default CashRegister', true)`,
       [crypto.randomUUID(), storeId]
+    );
+
+    // Same 7 defaults migration 026 seeded for pre-existing businesses
+    // (see Controllers/PaymentType.js) — missed here originally, so a
+    // business registering between migration 026 and this fix got zero
+    // PaymentType rows (harmless: usePosSale.js falls back to a
+    // hardcoded list when the fetch comes back empty, but every new
+    // business should still get real, editable rows like everyone
+    // else).
+    await client.query(
+      `INSERT INTO "PaymentType"
+        ("PaymentTypeID", "RegistrationID", "Name", "SequenceNo", "ShowInSales", "IsSystemDefined")
+       VALUES
+        ($1, $2, 'Cash', 1, true, true),
+        ($3, $2, 'GPay', 2, true, true),
+        ($4, $2, 'Card', 3, true, true),
+        ($5, $2, 'UPI', 4, true, true),
+        ($6, $2, 'Wallet', 5, true, true),
+        ($7, $2, 'Loyalty', 6, true, true),
+        ($8, $2, 'Cash From Counter', 7, true, true)
+       ON CONFLICT ("RegistrationID", "Name") DO NOTHING`,
+      [crypto.randomUUID(), registrationId, crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()]
+    );
+
+    // Same defaults migration 028 seeded for pre-existing businesses —
+    // see Controllers/PrintTemplate.js.
+    await client.query(
+      `INSERT INTO "PrintTemplate"
+        ("PrintTemplateID", "RegistrationID", "DocumentType", "HeaderNote", "FooterMessage", "ShowSignatureLine")
+       VALUES
+        ($1, $2, 'sale', 'Tax Invoice', 'THANK YOU FOR YOUR BUSINESS', true),
+        ($3, $2, 'purchase', 'Purchase Order', '', true)
+       ON CONFLICT ("RegistrationID", "DocumentType") DO NOTHING`,
+      [crypto.randomUUID(), registrationId, crypto.randomUUID()]
     );
 
     // The row that actually matters for access control — see the
