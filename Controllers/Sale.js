@@ -127,12 +127,11 @@ async function insertSaleItems(client, saleId, preparedItems) {
 // structure as Controllers/Purchase.js's createPurchase (store
 // ownership check, TransactionType/DocumentSeries numbering, server-side
 // tax computation, commit, then publish for posiverse-engine to apply
-// the InStock deduction asynchronously). Two deliberate simplifications
-// vs. Purchase for this first pass: no edit/return flow (a completed
-// sale isn't revised here), and no partial/credit payment — every sale
-// is recorded fully paid at checkout (DueAmount always 0), matching
-// what the POS payment screen actually captures today. CustomerID is
-// optional (walk-in sale, same as the POS screen's default).
+// the InStock deduction asynchronously). One deliberate simplification
+// vs. Purchase: no partial/credit payment — every sale is recorded
+// fully paid at checkout (DueAmount always 0), matching what the POS
+// payment screen actually captures today. CustomerID is optional
+// (walk-in sale, same as the POS screen's default).
 module.exports.createSale = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -312,6 +311,211 @@ module.exports.createSale = async (req, res) => {
     await client.query("ROLLBACK");
     console.error(error);
     return res.status(500).json({ success: false, message: "Error creating sale" });
+  } finally {
+    client.release();
+  }
+};
+
+// Edits a posted (not cancelled) Sale — header fields + a wholesale
+// replacement of its line items, same approach updatePurchase uses.
+// InvoiceNumber/TransactionTypeID/StoreID never change on edit — this
+// revises a document, it doesn't renumber or relocate it. Captures the
+// pre-edit sale + items purely so publishSaleEvent can hand
+// posiverse-engine's Sale consumer a real beforeData/afterData diff —
+// that consumer already does per-product qty delta math (before vs.
+// after), so an edit that changes quantities/items just works, the same
+// way updatePurchase's PurchaseUpdated already does on the Purchase
+// side.
+module.exports.updateSale = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const {
+      customerId,
+      refNo,
+      transactionDate,
+      notes,
+      items,
+      discountAmount: headerDiscount,
+      additionalCharges,
+      roundOff,
+      paymentMethod,
+    } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: "At least one item is required" });
+    }
+
+    await client.query("BEGIN");
+
+    const existingResult = await client.query(
+      `SELECT s.* FROM "Sale" s
+       JOIN "Store" st ON st."StoreID" = s."StoreID"
+       WHERE s."SaleID" = $1 AND st."RegistrationID" = $2
+       FOR UPDATE OF s`,
+      [id, req.user.RegistrationID]
+    );
+    if (existingResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Sale not found" });
+    }
+    const existing = existingResult.rows[0];
+
+    if (existing.Status === "cancelled") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "Can't edit a cancelled sale" });
+    }
+
+    if (customerId) {
+      const customerCheck = await client.query(
+        `SELECT "CustomerID" FROM "Customer" WHERE "CustomerID" = $1 AND "RegistrationID" = $2 AND "IsActive" = true`,
+        [customerId, req.user.RegistrationID]
+      );
+      if (customerCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, message: "Customer not found" });
+      }
+    }
+
+    const computed = await computeItems(client, items, req.user.RegistrationID);
+    if (computed.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: computed.error });
+    }
+    const { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal } = computed;
+
+    const extraDiscount = Number(headerDiscount) || 0;
+    const extraCharges = Number(additionalCharges) || 0;
+    const roundOffAmount = Number(roundOff) || 0;
+    const totalDiscount = lineDiscountTotal + extraDiscount;
+    const totalAmount = subtotal - totalDiscount + taxAmountTotal + extraCharges + roundOffAmount;
+
+    const updateResult = await client.query(
+      `UPDATE "Sale"
+       SET "CustomerID" = $1, "RefNo" = $2, "SaleDate" = COALESCE($3, "SaleDate"), "Notes" = $4,
+           "Subtotal" = $5, "DiscountAmount" = $6, "TaxAmount" = $7, "AdditionalCharges" = $8, "RoundOff" = $9,
+           "TotalAmount" = $10, "TotalQty" = $11, "PaymentMethod" = $12,
+           "Action" = 'EDIT', "ActionBy" = $13, "ActionByUID" = $14, "ActionOn" = now(), "UpdatedAt" = now()
+       WHERE "SaleID" = $15
+       RETURNING *`,
+      [
+        customerId || null,
+        refNo || null,
+        transactionDate || null,
+        notes || null,
+        subtotal,
+        extraDiscount,
+        taxAmountTotal,
+        extraCharges,
+        roundOffAmount,
+        totalAmount,
+        totalQty,
+        paymentMethod || existing.PaymentMethod || "cash",
+        req.user.Name || req.user.Email || null,
+        req.user.UserID || null,
+        id,
+      ]
+    );
+
+    // Old items captured BEFORE the delete/replace below, purely to
+    // hand posiverse-engine's Sale consumer a real "what changed" diff
+    // — this controller doesn't do anything with them itself.
+    const oldItemsResult = await client.query(`SELECT * FROM "SaleItem" WHERE "SaleID" = $1`, [id]);
+    const oldItems = oldItemsResult.rows.map(row => ({
+      productId: row.ProductID,
+      qty: Number(row.Quantity),
+      unitPrice: Number(row.UnitPrice),
+    }));
+
+    await client.query(`DELETE FROM "SaleItem" WHERE "SaleID" = $1`, [id]);
+    await insertSaleItems(client, id, preparedItems);
+
+    await client.query("COMMIT");
+
+    await publishSaleEvent({
+      eventType: "SaleUpdated",
+      sale: updateResult.rows[0],
+      items: preparedItems,
+      beforeSale: existing,
+      beforeItems: oldItems,
+    });
+
+    return res.json({ success: true, sale: updateResult.rows[0], items: preparedItems });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ success: false, message: "Error updating sale" });
+  } finally {
+    client.release();
+  }
+};
+
+// Cancels (voids) a posted Sale. Doesn't delete anything — Status flips
+// to 'cancelled' and the InStock this sale deducted is fully restored,
+// reusing the exact same before/after-delta mechanism updateSale (and
+// posiverse-engine's Sale consumer) already has: publish a SaleUpdated
+// event whose "after" item list is empty. The consumer computes
+// before=this sale's actual quantities, after=0, and applies the
+// reverse of the original deduction — no separate "SaleCancelled" event
+// type or extra consumer logic needed. A cancelled sale stays visible
+// in Sales/SaleView (Status shows as 'cancelled') rather than being
+// hidden or deleted, same as this app's soft-delete convention
+// elsewhere.
+module.exports.cancelSale = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+
+    await client.query("BEGIN");
+
+    const existingResult = await client.query(
+      `SELECT s.* FROM "Sale" s
+       JOIN "Store" st ON st."StoreID" = s."StoreID"
+       WHERE s."SaleID" = $1 AND st."RegistrationID" = $2
+       FOR UPDATE OF s`,
+      [id, req.user.RegistrationID]
+    );
+    if (existingResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Sale not found" });
+    }
+    const existing = existingResult.rows[0];
+
+    if (existing.Status === "cancelled") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "Sale is already cancelled" });
+    }
+
+    const existingItemsResult = await client.query(`SELECT * FROM "SaleItem" WHERE "SaleID" = $1`, [id]);
+    const existingItems = existingItemsResult.rows.map(row => ({
+      productId: row.ProductID,
+      qty: Number(row.Quantity),
+      unitPrice: Number(row.UnitPrice),
+    }));
+
+    const updateResult = await client.query(
+      `UPDATE "Sale"
+       SET "Status" = 'cancelled', "Action" = 'CANCEL', "ActionBy" = $1, "ActionByUID" = $2, "ActionOn" = now(), "UpdatedAt" = now()
+       WHERE "SaleID" = $3
+       RETURNING *`,
+      [req.user.Name || req.user.Email || null, req.user.UserID || null, id]
+    );
+
+    await client.query("COMMIT");
+
+    await publishSaleEvent({
+      eventType: "SaleUpdated",
+      sale: updateResult.rows[0],
+      items: [],
+      beforeSale: existing,
+      beforeItems: existingItems,
+    });
+
+    return res.json({ success: true, sale: updateResult.rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ success: false, message: "Error cancelling sale" });
   } finally {
     client.release();
   }
