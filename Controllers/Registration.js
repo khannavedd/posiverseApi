@@ -82,6 +82,11 @@ const OWNER_PERMISSIONS = [
   "transactiontype.create",
   "transactiontype.edit",
   "transactiontype.delete",
+
+  "paymenttype.view",
+  "paymenttype.create",
+  "paymenttype.edit",
+  "paymenttype.delete",
 ];
 
 // Registration/User/Store use bigint "ActionOn" columns rather than
