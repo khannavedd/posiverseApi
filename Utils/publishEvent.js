@@ -21,6 +21,11 @@ const pubsub = require("./pubsub");
 // response is sent, with no guarantee a background call completes.
 const TOPIC_BY_AGGREGATE = {
   Inventory: process.env.PUBSUB_TOPIC_INVENTORY,
+  // Sale gets its own topic/subscriber pair rather than reusing
+  // Inventory's — explicit decision, so Purchase's and Sale's InStock
+  // consumers stay fully independent (separate deploy, separate
+  // failure domain) instead of one consumer branching on eventType.
+  Sales: process.env.PUBSUB_TOPIC_SALES,
 };
 
 async function publishEvent({ aggregateType, eventType, beforeData, afterData, inventoryId }) {
@@ -80,4 +85,30 @@ async function publishPurchaseEvent({ eventType, purchase, items, beforePurchase
   });
 }
 
-module.exports = { publishEvent, publishPurchaseEvent };
+function saleSnapshot(sale) {
+  return {
+    SaleID: sale.SaleID,
+    StoreID: sale.StoreID,
+    CustomerID: sale.CustomerID,
+    TransactionTypeID: sale.TransactionTypeID,
+    InvoiceNumber: sale.InvoiceNumber,
+    SaleDate: sale.SaleDate,
+    DueAmount: sale.DueAmount,
+  };
+}
+
+// Same shape/pattern as publishPurchaseEvent, published to the separate
+// "Sales" topic instead — see TOPIC_BY_AGGREGATE above.
+async function publishSaleEvent({ eventType, sale, items, beforeSale, beforeItems }) {
+  await publishEvent({
+    aggregateType: "Sales",
+    eventType,
+    beforeData: beforeSale
+      ? { sale: saleSnapshot(beforeSale), items: beforeItems || [] }
+      : null,
+    afterData: { sale: saleSnapshot(sale), items },
+    inventoryId: sale.SaleID,
+  });
+}
+
+module.exports = { publishEvent, publishPurchaseEvent, publishSaleEvent };

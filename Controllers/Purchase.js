@@ -273,6 +273,17 @@ module.exports.createPurchase = async (req, res) => {
     }
     const { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal } = computed;
 
+    // extraDiscount ("Additional discount", typed once at the header)
+    // and lineDiscountTotal (the sum of every line's own Discount amt)
+    // are kept as two genuinely separate figures, matching how
+    // AdditionalCharges/RoundOff already stand alone rather than being
+    // folded into some other column. "Purchase"."DiscountAmount" stores
+    // ONLY extraDiscount — the header field's own value, nothing merged
+    // in — while the line-level total is never lost, it's just read
+    // back from the PurchaseItem rows themselves (SUM of their own
+    // DiscountAmount) whenever it's needed, same as any other per-item
+    // figure. totalAmount still has to subtract both, regardless of
+    // which one gets its own column.
     const extraDiscount = Number(headerDiscount) || 0;
     const extraCharges = Number(additionalCharges) || 0;
     const roundOffAmount = Number(roundOff) || 0;
@@ -305,7 +316,7 @@ module.exports.createPurchase = async (req, res) => {
         refNo || null,
         notes || null,
         subtotal,
-        totalDiscount,
+        extraDiscount,
         taxAmountTotal,
         extraCharges,
         roundOffAmount,
@@ -433,7 +444,7 @@ module.exports.updatePurchase = async (req, res) => {
         transactionDate || null,
         notes || null,
         subtotal,
-        totalDiscount,
+        extraDiscount,
         taxAmountTotal,
         extraCharges,
         roundOffAmount,

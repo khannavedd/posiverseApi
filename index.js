@@ -29,6 +29,7 @@ test();
  const BrandRoutes = require("./Routes/Brand");
  const TaxRoutes = require("./Routes/Tax");
  const VendorRoutes = require("./Routes/Vendor");
+ const CustomerRoutes = require("./Routes/Customer");
  const PurchaseRoutes = require("./Routes/Purchase");
  const TransactionTypeRoutes = require("./Routes/TransactionType");
 
@@ -53,6 +54,7 @@ app.use(
  app.use("/brands", BrandRoutes);
  app.use("/taxes", TaxRoutes);
  app.use("/vendors", VendorRoutes);
+ app.use("/customers", CustomerRoutes);
  app.use("/purchases", PurchaseRoutes);
  app.use("/transaction-types", TransactionTypeRoutes);
  // POST /register — the onboarding website lives in its own separate
