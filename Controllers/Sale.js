@@ -95,6 +95,62 @@ async function computeItems(client, items, registrationId) {
   return { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal };
 }
 
+// Closes the "can you oversell" gap: before a Sale is committed, checks
+// each 'goods' item's requested qty against what's actually on hand for
+// this store, treating a missing InStock row as 0 (a product with no
+// purchase history has never actually been received, so it isn't
+// sellable — consistent with how InStock rows only ever get created by
+// a Purchase in the first place). 'service' products don't carry stock
+// and are skipped entirely.
+//
+// existingItems (only passed by updateSale) lets an edit compare
+// against this sale's own current holding, not just raw InStockQty —
+// InStockQty already reflects this sale's ORIGINAL deduction (assuming
+// posiverse-engine has processed it by now), so the real ceiling for an
+// edit is InStockQty + whatever this sale already holds of that
+// product, not InStockQty alone (which would wrongly block someone
+// editing a sale without changing its quantities at all).
+//
+// This is a synchronous PRE-CHECK only — actual deduction still happens
+// asynchronously via posiverse-engine after commit. It closes the
+// realistic "rang up more than what's on the shelf" case, but does NOT
+// fully close a true race between two concurrent sales of the very last
+// unit landing in the same instant (that would need the deduction
+// itself to happen synchronously and row-locked — a bigger change,
+// deliberately not done here; see DECISIONS.md).
+async function assertStockAvailable(client, storeId, preparedItems, existingItems = []) {
+  const requestedByProduct = new Map();
+  for (const item of preparedItems) {
+    requestedByProduct.set(item.productId, (requestedByProduct.get(item.productId) || 0) + item.qty);
+  }
+  if (requestedByProduct.size === 0) return null;
+
+  const existingByProduct = new Map();
+  for (const item of existingItems) {
+    existingByProduct.set(item.productId, (existingByProduct.get(item.productId) || 0) + (Number(item.qty) || 0));
+  }
+
+  const productIds = [...requestedByProduct.keys()];
+  const stockResult = await client.query(
+    `SELECT pr."ProductID", pr."Name", pr."ProductType", COALESCE(i."InStockQty", 0) AS "InStockQty"
+     FROM "Product" pr
+     LEFT JOIN "InStock" i ON i."ProductID" = pr."ProductID" AND i."StoreID" = $2
+     WHERE pr."ProductID" = ANY($1::uuid[])`,
+    [productIds, storeId]
+  );
+
+  for (const row of stockResult.rows) {
+    if (row.ProductType !== "goods") continue; // services carry no stock
+    const requested = requestedByProduct.get(row.ProductID) || 0;
+    const alreadyHeld = existingByProduct.get(row.ProductID) || 0;
+    const available = Number(row.InStockQty) + alreadyHeld;
+    if (requested > available) {
+      return { error: `Not enough stock for "${row.Name}" — ${available} available, ${requested} requested` };
+    }
+  }
+  return null;
+}
+
 async function insertSaleItems(client, saleId, preparedItems) {
   for (const item of preparedItems) {
     await client.query(
@@ -249,6 +305,12 @@ module.exports.createSale = async (req, res) => {
     }
     const { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal } = computed;
 
+    const stockCheck = await assertStockAvailable(client, storeId, preparedItems);
+    if (stockCheck?.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: stockCheck.error });
+    }
+
     const extraDiscount = Number(headerDiscount) || 0;
     const extraCharges = Number(additionalCharges) || 0;
     const roundOffAmount = Number(roundOff) || 0;
@@ -384,6 +446,23 @@ module.exports.updateSale = async (req, res) => {
     }
     const { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal } = computed;
 
+    // Fetched here (before the replace below) so assertStockAvailable
+    // can compare against what THIS sale already holds, not just raw
+    // InStockQty — also reused further down as beforeItems for
+    // publishSaleEvent's diff, same row set either way.
+    const oldItemsResult = await client.query(`SELECT * FROM "SaleItem" WHERE "SaleID" = $1`, [id]);
+    const oldItems = oldItemsResult.rows.map(row => ({
+      productId: row.ProductID,
+      qty: Number(row.Quantity),
+      unitPrice: Number(row.UnitPrice),
+    }));
+
+    const stockCheck = await assertStockAvailable(client, existing.StoreID, preparedItems, oldItems);
+    if (stockCheck?.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: stockCheck.error });
+    }
+
     const extraDiscount = Number(headerDiscount) || 0;
     const extraCharges = Number(additionalCharges) || 0;
     const roundOffAmount = Number(roundOff) || 0;
@@ -417,16 +496,9 @@ module.exports.updateSale = async (req, res) => {
       ]
     );
 
-    // Old items captured BEFORE the delete/replace below, purely to
-    // hand posiverse-engine's Sale consumer a real "what changed" diff
-    // — this controller doesn't do anything with them itself.
-    const oldItemsResult = await client.query(`SELECT * FROM "SaleItem" WHERE "SaleID" = $1`, [id]);
-    const oldItems = oldItemsResult.rows.map(row => ({
-      productId: row.ProductID,
-      qty: Number(row.Quantity),
-      unitPrice: Number(row.UnitPrice),
-    }));
-
+    // oldItems (this sale's pre-edit lines) was already captured above,
+    // before assertStockAvailable ran — reused here as-is for
+    // publishSaleEvent's before/after diff.
     await client.query(`DELETE FROM "SaleItem" WHERE "SaleID" = $1`, [id]);
     await insertSaleItems(client, id, preparedItems);
 

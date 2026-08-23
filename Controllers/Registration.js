@@ -90,6 +90,9 @@ const OWNER_PERMISSIONS = [
 
   "printtemplate.view",
   "printtemplate.edit",
+
+  "printer.view",
+  "printer.edit",
 ];
 
 // Registration/User/Store use bigint "ActionOn" columns rather than

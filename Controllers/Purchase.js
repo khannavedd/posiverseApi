@@ -404,6 +404,19 @@ module.exports.updatePurchase = async (req, res) => {
     }
     const existing = existingResult.rows[0];
 
+    // Same guard updateSale already has (Controllers/Sale.js) — without
+    // this, editing an already-cancelled purchase would republish the
+    // ORIGINAL (pre-cancel) item quantities/DueAmount as the new
+    // "before" state to posiverse-engine's InStock + vendor-due
+    // consumers, even though cancelPurchase already reversed those
+    // effects. That desyncs InStock and Vendor.DueAmount from what the
+    // Purchase record actually says, while Status still silently reads
+    // 'cancelled'. Caught in review, not user-reported.
+    if (existing.Status === "cancelled") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "Can't edit a cancelled purchase" });
+    }
+
     const vendorCheck = await client.query(
       `SELECT "VendorID" FROM "Vendor" WHERE "VendorID" = $1 AND "RegistrationID" = $2 AND "IsActive" = true`,
       [vendorId, req.user.RegistrationID]
@@ -491,6 +504,87 @@ module.exports.updatePurchase = async (req, res) => {
     await client.query("ROLLBACK");
     console.error(error);
     return res.status(500).json({ success: false, message: "Error updating purchase" });
+  } finally {
+    client.release();
+  }
+};
+
+// Cancels (voids) a posted Purchase. Doesn't delete anything — Status
+// flips to 'cancelled', the InStock this purchase added is reversed,
+// and the DueAmount it contributed to the vendor is reversed too (a
+// cancelled purchase means this business no longer owes the vendor for
+// those voided goods — confirmed with the owner rather than assumed).
+// Reuses the exact same before/after-delta mechanism updatePurchase
+// (and posiverse-engine's InStock + vendor-due consumers) already
+// have: publish a PurchaseUpdated event whose "after" item list is
+// empty and whose "after" purchase has DueAmount zeroed. The InStock
+// consumer computes before=this purchase's actual quantities, after=0,
+// and reverses the original addition; the vendor-due consumer computes
+// before=this purchase's old DueAmount, after=0, and applies that
+// reversal to the vendor. No separate "PurchaseCancelled" event type
+// or extra consumer logic needed — same pattern Controllers/Sale.js's
+// cancelSale already established. PaymentStatus is set to 'paid'
+// alongside DueAmount=0 purely to keep those two columns internally
+// consistent (DueAmount 0 always means PaymentStatus 'paid' elsewhere
+// in this table) — the frontend shows a "cancelled" pill instead of
+// PaymentStatus once Status is 'cancelled', so this never surfaces as
+// a confusing "PAID" label on a voided purchase.
+module.exports.cancelPurchase = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+
+    await client.query("BEGIN");
+
+    const existingResult = await client.query(
+      `SELECT p.* FROM "Purchase" p
+       JOIN "Store" s ON s."StoreID" = p."StoreID"
+       WHERE p."PurchaseID" = $1 AND s."RegistrationID" = $2
+       FOR UPDATE OF p`,
+      [id, req.user.RegistrationID]
+    );
+    if (existingResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Purchase not found" });
+    }
+    const existing = existingResult.rows[0];
+
+    if (existing.Status === "cancelled") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "Purchase is already cancelled" });
+    }
+
+    const existingItemsResult = await client.query(`SELECT * FROM "PurchaseItem" WHERE "PurchaseID" = $1`, [id]);
+    const existingItems = existingItemsResult.rows.map(row => ({
+      productId: row.ProductID,
+      qty: Number(row.Qty),
+      unitCost: Number(row.UnitCost),
+    }));
+
+    const updateResult = await client.query(
+      `UPDATE "Purchase"
+       SET "Status" = 'cancelled', "DueAmount" = 0, "PaymentStatus" = 'paid',
+           "Action" = 'CANCEL', "ActionBy" = $1, "ActionByUID" = $2, "ActionOn" = now(), "UpdatedAt" = now()
+       WHERE "PurchaseID" = $3
+       RETURNING *`,
+      [req.user.Name || req.user.Email || null, req.user.UserID || null, id]
+    );
+
+    await client.query("COMMIT");
+
+    await publishPurchaseEvent({
+      eventType: "PurchaseUpdated",
+      purchase: updateResult.rows[0],
+      items: [],
+      beforePurchase: existing,
+      beforeItems: existingItems,
+    });
+
+    return res.json({ success: true, purchase: updateResult.rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ success: false, message: "Error cancelling purchase" });
   } finally {
     client.release();
   }
