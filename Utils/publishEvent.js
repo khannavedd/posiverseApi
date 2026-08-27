@@ -111,4 +111,21 @@ async function publishSaleEvent({ eventType, sale, items, beforeSale, beforeItem
   });
 }
 
-module.exports = { publishEvent, publishPurchaseEvent, publishSaleEvent };
+// A customer payment isn't a Sale write, but it's still money moving
+// against a customer's balance — reuses the "Sales" topic/aggregateType
+// rather than minting a third topic, so posiverse-engine's customerDue
+// consumer (already subscribed to "sale-events" for SaleCreated/
+// SaleUpdated) can pick this up on the same subscription. The existing
+// InStock consumer on that same topic already ignores any eventType it
+// doesn't recognize, so this is safe to add without touching it.
+async function publishCustomerPaymentEvent({ customerId, storeId, amount }) {
+  await publishEvent({
+    aggregateType: "Sales",
+    eventType: "CustomerPaymentCreated",
+    beforeData: null,
+    afterData: { customerId, storeId, amount },
+    inventoryId: customerId,
+  });
+}
+
+module.exports = { publishEvent, publishPurchaseEvent, publishSaleEvent, publishCustomerPaymentEvent };

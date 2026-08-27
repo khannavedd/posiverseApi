@@ -95,6 +95,66 @@ async function computeItems(client, items, registrationId) {
   return { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal };
 }
 
+// Split-payment validation + the same paid/due/status derivation
+// Controllers/Purchase.js's createPurchase already uses for
+// paidAmount/dueAmount/paymentStatus — mirrored here rather than
+// extracted into a shared helper, matching how computeItems-style logic
+// is already duplicated once between these two files rather than
+// factored out.
+//
+// Accepts either the new `payments: [{method, amount}]` array, or the
+// old single `paymentMethod` string for backward compatibility with any
+// caller that hasn't moved to the array shape yet — a bare string is
+// treated as one tender covering the full total. Rejects (does not
+// clamp) if the tendered total exceeds the sale total: the payment
+// screen caps entry so this should never legitimately happen, and
+// silently clamping would hide a real client bug instead of surfacing
+// it. A due balance is only allowed against a real customer — a
+// walk-in has no identity to collect from later.
+function derivePayments({ payments, paymentMethod, totalAmount, customerId }) {
+  let preparedPayments;
+  if (Array.isArray(payments) && payments.length > 0) {
+    preparedPayments = payments.map(p => ({
+      method: typeof p.method === "string" ? p.method.trim() : "",
+      amount: Number(p.amount),
+    }));
+  } else if (paymentMethod) {
+    preparedPayments = [{ method: String(paymentMethod).trim(), amount: totalAmount }];
+  } else {
+    return { error: "Select a payment method" };
+  }
+
+  for (const p of preparedPayments) {
+    if (!p.method || !Number.isFinite(p.amount) || p.amount <= 0) {
+      return { error: "Each payment needs a valid method and amount" };
+    }
+  }
+
+  const totalPaid = preparedPayments.reduce((sum, p) => sum + p.amount, 0);
+  if (totalPaid > totalAmount + 0.01) {
+    return { error: "Payments add up to more than the sale total" };
+  }
+
+  const dueAmount = Math.max(totalAmount - totalPaid, 0);
+  if (dueAmount > 0 && !customerId) {
+    return { error: "A customer is required to record a sale with an outstanding balance" };
+  }
+
+  const paymentStatus = dueAmount <= 0 ? "paid" : totalPaid > 0 ? "partial" : "unpaid";
+  const paymentMethodSummary = preparedPayments.length === 1 ? preparedPayments[0].method : "Split";
+
+  return { preparedPayments, totalPaid, dueAmount, paymentStatus, paymentMethodSummary };
+}
+
+async function insertSalePayments(client, saleId, preparedPayments) {
+  for (const p of preparedPayments) {
+    await client.query(
+      `INSERT INTO "SalePayment" ("SalePaymentID", "SaleID", "Method", "Amount") VALUES ($1, $2, $3, $4)`,
+      [crypto.randomUUID(), saleId, p.method, p.amount]
+    );
+  }
+}
+
 // Closes the "can you oversell" gap: before a Sale is committed, checks
 // each 'goods' item's requested qty against what's actually on hand for
 // this store, treating a missing InStock row as 0 (a product with no
@@ -202,6 +262,7 @@ module.exports.createSale = async (req, res) => {
       additionalCharges,
       roundOff,
       paymentMethod,
+      payments,
     } = req.body;
 
     if (!storeId) return res.status(400).json({ success: false, message: "storeId is required" });
@@ -317,6 +378,13 @@ module.exports.createSale = async (req, res) => {
     const totalDiscount = lineDiscountTotal + extraDiscount;
     const totalAmount = subtotal - totalDiscount + taxAmountTotal + extraCharges + roundOffAmount;
 
+    const paymentResult = derivePayments({ payments, paymentMethod, totalAmount, customerId });
+    if (paymentResult.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: paymentResult.error });
+    }
+    const { preparedPayments, dueAmount, paymentStatus, paymentMethodSummary } = paymentResult;
+
     const saleId = crypto.randomUUID();
     const saleResult = await client.query(
       `INSERT INTO "Sale"
@@ -326,8 +394,8 @@ module.exports.createSale = async (req, res) => {
          "Action", "ActionBy", "ActionByUID", "ActionOn")
        VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()), $7,
          $8, $9, $10, $11, $12, $13, $14,
-         $15, 'paid', 0, 'completed', $16, $17,
-         'NEW', $18, $19, now())
+         $15, $16, $17, 'completed', $18, $19,
+         'NEW', $20, $21, now())
        RETURNING *`,
       [
         saleId,
@@ -344,7 +412,9 @@ module.exports.createSale = async (req, res) => {
         roundOffAmount,
         totalAmount,
         totalQty,
-        paymentMethod || "cash",
+        paymentMethodSummary,
+        paymentStatus,
+        dueAmount,
         refNo || null,
         notes || null,
         req.user.Name || req.user.Email || null,
@@ -354,12 +424,14 @@ module.exports.createSale = async (req, res) => {
     const sale = saleResult.rows[0];
 
     await insertSaleItems(client, saleId, preparedItems);
+    await insertSalePayments(client, saleId, preparedPayments);
 
     // No Customer.OutstandingBalance write here, and no InStock write
     // either — this endpoint only records the sale itself. The InStock
-    // deduction is applied by posiverse-engine's Sale consumer, reacting
-    // to the SaleCreated event published below, on its own dedicated
-    // topic (kept separate from Purchase's, by explicit decision).
+    // deduction, and now the Customer.OutstandingBalance adjustment for
+    // any dueAmount above, are both applied by posiverse-engine,
+    // reacting to the SaleCreated event published below (see
+    // onSaleCreateUpdateInStock.js and the new customerDue.js).
     await client.query("COMMIT");
 
     await publishSaleEvent({
@@ -402,6 +474,7 @@ module.exports.updateSale = async (req, res) => {
       additionalCharges,
       roundOff,
       paymentMethod,
+      payments,
     } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -469,16 +542,33 @@ module.exports.updateSale = async (req, res) => {
     const totalDiscount = lineDiscountTotal + extraDiscount;
     const totalAmount = subtotal - totalDiscount + taxAmountTotal + extraCharges + roundOffAmount;
 
+    // Resolved the same way the UPDATE below actually writes CustomerID
+    // (customerId || null — an edit that omits it clears the customer,
+    // same pre-existing behavior as before this change), so the due-
+    // amount-needs-a-customer check matches what's really being saved.
+    const resolvedCustomerId = customerId || null;
+    const paymentResult = derivePayments({
+      payments,
+      paymentMethod: paymentMethod || existing.PaymentMethod,
+      totalAmount,
+      customerId: resolvedCustomerId,
+    });
+    if (paymentResult.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: paymentResult.error });
+    }
+    const { preparedPayments, dueAmount, paymentStatus, paymentMethodSummary } = paymentResult;
+
     const updateResult = await client.query(
       `UPDATE "Sale"
        SET "CustomerID" = $1, "RefNo" = $2, "SaleDate" = COALESCE($3, "SaleDate"), "Notes" = $4,
            "Subtotal" = $5, "DiscountAmount" = $6, "TaxAmount" = $7, "AdditionalCharges" = $8, "RoundOff" = $9,
-           "TotalAmount" = $10, "TotalQty" = $11, "PaymentMethod" = $12,
-           "Action" = 'EDIT', "ActionBy" = $13, "ActionByUID" = $14, "ActionOn" = now(), "UpdatedAt" = now()
-       WHERE "SaleID" = $15
+           "TotalAmount" = $10, "TotalQty" = $11, "PaymentMethod" = $12, "PaymentStatus" = $13, "DueAmount" = $14,
+           "Action" = 'EDIT', "ActionBy" = $15, "ActionByUID" = $16, "ActionOn" = now(), "UpdatedAt" = now()
+       WHERE "SaleID" = $17
        RETURNING *`,
       [
-        customerId || null,
+        resolvedCustomerId,
         refNo || null,
         transactionDate || null,
         notes || null,
@@ -489,7 +579,9 @@ module.exports.updateSale = async (req, res) => {
         roundOffAmount,
         totalAmount,
         totalQty,
-        paymentMethod || existing.PaymentMethod || "cash",
+        paymentMethodSummary,
+        paymentStatus,
+        dueAmount,
         req.user.Name || req.user.Email || null,
         req.user.UserID || null,
         id,
@@ -501,6 +593,9 @@ module.exports.updateSale = async (req, res) => {
     // publishSaleEvent's before/after diff.
     await client.query(`DELETE FROM "SaleItem" WHERE "SaleID" = $1`, [id]);
     await insertSaleItems(client, id, preparedItems);
+
+    await client.query(`DELETE FROM "SalePayment" WHERE "SaleID" = $1`, [id]);
+    await insertSalePayments(client, id, preparedPayments);
 
     await client.query("COMMIT");
 
@@ -565,9 +660,15 @@ module.exports.cancelSale = async (req, res) => {
       unitPrice: Number(row.UnitPrice),
     }));
 
+    // DueAmount zeroed alongside Status — a cancelled sale no longer
+    // owes anything, and this is what lets the delta math below (and
+    // posiverse-engine's customerDue consumer, reading this same
+    // before/after diff) correctly reverse whatever this sale had
+    // contributed to Customer.OutstandingBalance. Same idea as items:
+    // [] below already reversing the InStock deduction.
     const updateResult = await client.query(
       `UPDATE "Sale"
-       SET "Status" = 'cancelled', "Action" = 'CANCEL', "ActionBy" = $1, "ActionByUID" = $2, "ActionOn" = now(), "UpdatedAt" = now()
+       SET "Status" = 'cancelled', "DueAmount" = 0, "Action" = 'CANCEL', "ActionBy" = $1, "ActionByUID" = $2, "ActionOn" = now(), "UpdatedAt" = now()
        WHERE "SaleID" = $3
        RETURNING *`,
       [req.user.Name || req.user.Email || null, req.user.UserID || null, id]
@@ -644,7 +745,16 @@ module.exports.getSale = async (req, res) => {
       [id]
     );
 
-    return res.json({ success: true, sale: saleResult.rows[0], items: itemsResult.rows });
+    // Itemized tender breakdown — only meaningfully different from
+    // sale.PaymentMethod when that field reads "Split" (see
+    // derivePayments), but always returned so SaleView doesn't need a
+    // second round-trip.
+    const paymentsResult = await pool.query(
+      `SELECT * FROM "SalePayment" WHERE "SaleID" = $1 ORDER BY "CreatedAt" ASC`,
+      [id]
+    );
+
+    return res.json({ success: true, sale: saleResult.rows[0], items: itemsResult.rows, payments: paymentsResult.rows });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ success: false, message: "Error fetching sale" });

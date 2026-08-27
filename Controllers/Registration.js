@@ -45,6 +45,7 @@ const OWNER_PERMISSIONS = [
   "sales.create",
   "sales.edit",
   "sales.return",
+  "sales.payment",
 
   "purchase.view",
   "purchase.create",
@@ -226,6 +227,21 @@ module.exports.register = async (req, res) => {
         ($3, $2, 'purchase', 'PURCHASE', 'Purchase Entry', 'in')
        ON CONFLICT ("RegistrationID", "Code") DO NOTHING`,
       [crypto.randomUUID(), registrationId, crypto.randomUUID()]
+    );
+
+    // "Receive Payment" — its own row, own explicit flags, since it
+    // needs different defaults than SALE/PURCHASE above (no stock
+    // impact, no tax, not itself a sale). Existing businesses get this
+    // same row via migration 032/033's backfill.
+    await client.query(
+      `INSERT INTO "TransactionType"
+        ("TransactionTypeID", "RegistrationID", "Module", "Code", "Name", "Direction",
+         "CalculateTax", "CustomerMandatory", "DiscountAllowed", "PaymentModeRequired",
+         "SalesImpact", "UpdateStock")
+       VALUES ($1, $2, 'sales', 'RECEIVE_PAYMENT', 'Receive Payment', 'neutral',
+         false, true, false, true, false, false)
+       ON CONFLICT ("RegistrationID", "Code") DO NOTHING`,
+      [crypto.randomUUID(), registrationId]
     );
 
     // Every store gets a default cash register/counter so
