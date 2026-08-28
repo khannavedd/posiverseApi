@@ -94,6 +94,15 @@ function saleSnapshot(sale) {
     InvoiceNumber: sale.InvoiceNumber,
     SaleDate: sale.SaleDate,
     DueAmount: sale.DueAmount,
+    // TotalAmount/Status added for posiverse-engine's customerDue
+    // consumer — a "Receive Payment" Sale (see Controllers/Sale.js's
+    // recordCustomerPayment) has no DueAmount to speak of; the
+    // consumer needs TotalAmount (what was actually received) and
+    // Status (so a cancelled payment correctly stops counting, the
+    // same way a cancelled regular sale's DueAmount is zeroed) to
+    // apply it to Customer.OutstandingBalance.
+    TotalAmount: sale.TotalAmount,
+    Status: sale.Status,
   };
 }
 
@@ -111,21 +120,4 @@ async function publishSaleEvent({ eventType, sale, items, beforeSale, beforeItem
   });
 }
 
-// A customer payment isn't a Sale write, but it's still money moving
-// against a customer's balance — reuses the "Sales" topic/aggregateType
-// rather than minting a third topic, so posiverse-engine's customerDue
-// consumer (already subscribed to "sale-events" for SaleCreated/
-// SaleUpdated) can pick this up on the same subscription. The existing
-// InStock consumer on that same topic already ignores any eventType it
-// doesn't recognize, so this is safe to add without touching it.
-async function publishCustomerPaymentEvent({ customerId, storeId, amount }) {
-  await publishEvent({
-    aggregateType: "Sales",
-    eventType: "CustomerPaymentCreated",
-    beforeData: null,
-    afterData: { customerId, storeId, amount },
-    inventoryId: customerId,
-  });
-}
-
-module.exports = { publishEvent, publishPurchaseEvent, publishSaleEvent, publishCustomerPaymentEvent };
+module.exports = { publishEvent, publishPurchaseEvent, publishSaleEvent };

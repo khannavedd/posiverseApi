@@ -1,22 +1,28 @@
 -- Migration 032: Split payment + receive-payment-for-outstanding
 --
--- Two new tables, purely additive — no existing column touched:
+-- One new table, purely additive — no existing column touched:
 --
--- "SalePayment" — one row per tender at checkout. Sale.PaymentMethod
--- stays as the single-string summary column it already is (now holding
--- the sole method's name, or 'Split' when >1 tender was used); this
--- table is the itemized breakdown. "Method" is a plain string, not a
--- FK to PaymentType — same deliberate no-FK choice PaymentType.js's own
--- comment already documents for Sale.PaymentMethod (a PaymentType can
--- be renamed/soft-deleted later without orphaning historical rows).
+-- "SalePayment" — one row per tender, on ANY Sale (a regular goods
+-- sale split across methods, or a "Receive Payment" collection — see
+-- below). Sale.PaymentMethod stays as the single-string summary column
+-- it already is (now holding the sole method's name, or 'Split' when
+-- >1 tender was used); this table is the itemized breakdown. "Method"
+-- is a plain string, not a FK to PaymentType — same deliberate no-FK
+-- choice PaymentType.js's own comment already documents for
+-- Sale.PaymentMethod (a PaymentType can be renamed/soft-deleted later
+-- without orphaning historical rows).
 --
--- "CustomerPayment" — full ledger of payments received against a
--- customer's running outstanding balance (not allocated to any one
--- Sale — same "single running balance" shape Vendor.DueAmount already
--- has, just with real history kept instead of only a total). Gets its
--- own document number via the same DocumentSeries/TransactionType
--- numbering machinery Sale/Purchase already use — see the
--- RECEIVE_PAYMENT TransactionType seeded below.
+-- Receiving a payment against a customer's outstanding balance is NOT
+-- a separate ledger table — by explicit decision, it's recorded as an
+-- ordinary row in "Sale" itself, under the "RECEIVE_PAYMENT"
+-- TransactionType seeded below (Direction 'neutral', no stock/sales
+-- impact, no line items). This gets it a real DocumentSeries-issued
+-- number and full edit/cancel support for free, via the same Sale
+-- endpoints/UI a goods sale already has — see Controllers/Sale.js's
+-- recordCustomerPayment. posiverse-engine's customerDue consumer reads
+-- a Sale row's TransactionType to tell the two apart: a regular sale's
+-- DueAmount ADDS to Customer.OutstandingBalance, a RECEIVE_PAYMENT
+-- sale's TotalAmount SUBTRACTS from it.
 --
 -- Run with:
 --   psql "$DATABASE_URL" -f DB/migrations/032_create_sale_customer_payment_tables.sql
@@ -32,27 +38,6 @@ CREATE TABLE IF NOT EXISTS "SalePayment" (
 );
 
 CREATE INDEX IF NOT EXISTS idx_salepayment_sale ON "SalePayment"("SaleID");
-
-CREATE TABLE IF NOT EXISTS "CustomerPayment" (
-  "CustomerPaymentID" uuid PRIMARY KEY,
-  "RegistrationID" uuid NOT NULL,
-  "StoreID" uuid NOT NULL,
-  "CustomerID" uuid NOT NULL REFERENCES "Customer"("CustomerID"),
-  "TransactionTypeID" uuid REFERENCES "TransactionType"("TransactionTypeID"),
-  "PaymentNumber" varchar(32),
-  "Amount" numeric(12,2) NOT NULL,
-  "Method" varchar(64),
-  "Notes" text,
-  "Action" varchar(16) NOT NULL DEFAULT 'NEW',
-  "ActionBy" varchar(255),
-  "ActionByUID" uuid,
-  "ActionOn" timestamptz NOT NULL DEFAULT now(),
-  "CreatedAt" timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_customerpayment_customer ON "CustomerPayment"("CustomerID");
-CREATE INDEX IF NOT EXISTS idx_customerpayment_store ON "CustomerPayment"("StoreID");
-CREATE INDEX IF NOT EXISTS idx_customerpayment_registration ON "CustomerPayment"("RegistrationID");
 
 -- Seed the "Receive Payment" TransactionType for every business that
 -- already exists (mirrors migration 012's per-RegistrationID seeding

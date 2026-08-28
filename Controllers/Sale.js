@@ -694,6 +694,218 @@ module.exports.cancelSale = async (req, res) => {
   }
 };
 
+// Recording a payment against a customer's outstanding balance IS a
+// Sale — same table, same DocumentSeries numbering, same split-tender
+// machinery (SalePayment via insertSalePayments), just under the
+// "RECEIVE_PAYMENT" TransactionType instead of "SALE", and with no line
+// items (there's nothing being sold). This is a deliberate choice over
+// a bespoke ledger table: it gets a real document number, shows up
+// wherever Sales are listed, and — for free — can be edited/cancelled
+// through the exact same `PUT /sales/:id` / `PUT /sales/:id/cancel`
+// endpoints any other Sale already has, no new code needed for that.
+//
+// Unlike createSale, TotalAmount isn't computed from items/tax/discount
+// — there's nothing to derive it from, so it simply IS the sum of the
+// tendered payments. DueAmount is always 0 and PaymentStatus always
+// 'paid' — a payment record can't itself be "partially paid"; if less
+// was collected than intended, that's just a smaller payment amount,
+// not a due balance on the payment itself.
+//
+// posiverse-engine's customerDue consumer tells this apart from a
+// regular sale by TransactionType.Code, and applies the OPPOSITE sign
+// to Customer.OutstandingBalance — a regular sale's DueAmount adds to
+// what's owed, this sale's TotalAmount subtracts from it.
+module.exports.recordCustomerPayment = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id: customerId } = req.params;
+    const { storeId, payments, refNo, notes, transactionDate } = req.body;
+
+    if (!storeId) return res.status(400).json({ success: false, message: "storeId is required" });
+    if (!Array.isArray(payments) || payments.length === 0) {
+      return res.status(400).json({ success: false, message: "At least one payment is required" });
+    }
+
+    const preparedPayments = payments.map(p => ({
+      method: typeof p.method === "string" ? p.method.trim() : "",
+      amount: Number(p.amount),
+    }));
+    for (const p of preparedPayments) {
+      if (!p.method || !Number.isFinite(p.amount) || p.amount <= 0) {
+        return res.status(400).json({ success: false, message: "Each payment needs a valid method and amount" });
+      }
+    }
+    const totalAmount = preparedPayments.reduce((sum, p) => sum + p.amount, 0);
+
+    await client.query("BEGIN");
+
+    const customerCheck = await client.query(
+      `SELECT "CustomerID" FROM "Customer" WHERE "CustomerID" = $1 AND "RegistrationID" = $2 AND "IsActive" = true`,
+      [customerId, req.user.RegistrationID]
+    );
+    if (customerCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+
+    const storeCheck = await client.query(
+      `SELECT "StoreID", "StoreCode" FROM "Store" WHERE "StoreID" = $1 AND "RegistrationID" = $2`,
+      [storeId, req.user.RegistrationID]
+    );
+    if (storeCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Store not found" });
+    }
+    const store = storeCheck.rows[0];
+
+    const txnTypeResult = await client.query(
+      `SELECT * FROM "TransactionType"
+       WHERE "RegistrationID" = $1 AND "Code" = 'RECEIVE_PAYMENT' AND "IsActive" = true`,
+      [req.user.RegistrationID]
+    );
+    if (txnTypeResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "Receive Payment transaction type isn't set up for this business" });
+    }
+    const transactionType = txnTypeResult.rows[0];
+
+    const cashRegisterResult = await client.query(
+      `SELECT "Code" FROM "CashRegister" WHERE "StoreID" = $1 AND "IsActive" = true ORDER BY "CreatedAt" ASC LIMIT 1`,
+      [storeId]
+    );
+    const defaultCashRegisterCode = cashRegisterResult.rows[0]?.Code || null;
+
+    // Same series lookup/lock/increment pattern as createSale, scoped
+    // to this TransactionType so "Receive Payment" gets its own running
+    // number sequence, independent of Sales Invoice's.
+    let seriesResult = await client.query(
+      `SELECT * FROM "DocumentSeries"
+       WHERE "StoreID" = $1 AND "TransactionTypeID" = $2 AND "CashRegisterID" IS NULL
+       FOR UPDATE`,
+      [storeId, transactionType.TransactionTypeID]
+    );
+
+    let series;
+    if (seriesResult.rows.length === 0) {
+      try {
+        const inserted = await client.query(
+          `INSERT INTO "DocumentSeries"
+            ("DocumentSeriesID", "StoreID", "TransactionTypeID", "CurrentNumber", "IsActive")
+           VALUES ($1, $2, $3, 0, true)
+           RETURNING *`,
+          [crypto.randomUUID(), storeId, transactionType.TransactionTypeID]
+        );
+        series = inserted.rows[0];
+      } catch (insertError) {
+        if (insertError.code === "23505") {
+          const retry = await client.query(
+            `SELECT * FROM "DocumentSeries"
+             WHERE "StoreID" = $1 AND "TransactionTypeID" = $2 AND "CashRegisterID" IS NULL
+             FOR UPDATE`,
+            [storeId, transactionType.TransactionTypeID]
+          );
+          series = retry.rows[0];
+        } else {
+          throw insertError;
+        }
+      }
+    } else {
+      series = seriesResult.rows[0];
+    }
+
+    const nextNumber = series.CurrentNumber + 1;
+    await client.query(
+      `UPDATE "DocumentSeries" SET "CurrentNumber" = $1 WHERE "DocumentSeriesID" = $2`,
+      [nextNumber, series.DocumentSeriesID]
+    );
+    const paymentNumber = formatTransactionNumber(transactionType.NumberingFormat, {
+      code: transactionType.Code,
+      storeCode: store.StoreCode,
+      cashRegisterCode: defaultCashRegisterCode,
+      runningNumber: nextNumber,
+    });
+
+    const saleId = crypto.randomUUID();
+    const saleResult = await client.query(
+      `INSERT INTO "Sale"
+        ("SaleID", "StoreID", "InvoiceNumber", "CustomerID", "TransactionTypeID", "SaleDate", "CashierID",
+         "Subtotal", "DiscountAmount", "TaxAmount", "AdditionalCharges", "RoundOff", "TotalAmount", "TotalQty",
+         "PaymentMethod", "PaymentStatus", "DueAmount", "Status", "RefNo", "Notes",
+         "Action", "ActionBy", "ActionByUID", "ActionOn")
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()), $7,
+         $8, 0, 0, 0, 0, $8, 0,
+         $9, 'paid', 0, 'completed', $10, $11,
+         'NEW', $12, $13, now())
+       RETURNING *`,
+      [
+        saleId,
+        storeId,
+        paymentNumber,
+        customerId,
+        transactionType.TransactionTypeID,
+        transactionDate || null,
+        req.user.UserID || null,
+        totalAmount,
+        preparedPayments.length === 1 ? preparedPayments[0].method : "Split",
+        refNo || null,
+        notes || null,
+        req.user.Name || req.user.Email || null,
+        req.user.UserID || null,
+      ]
+    );
+    const sale = saleResult.rows[0];
+
+    // No insertSaleItems call — a payment collection has no line items.
+    await insertSalePayments(client, saleId, preparedPayments);
+
+    await client.query("COMMIT");
+
+    await publishSaleEvent({ eventType: "SaleCreated", sale, items: [] });
+
+    return res.json({ success: true, sale });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ success: false, message: "Error recording payment" });
+  } finally {
+    client.release();
+  }
+};
+
+// Payment history for one customer — every Sale under the
+// "RECEIVE_PAYMENT" TransactionType for this CustomerID, newest first.
+// Cancelled ones stay in the list (Status shows 'cancelled') rather
+// than being filtered out, same convention SaleView already uses for
+// regular sales — the customerDue consumer already excludes a
+// cancelled payment's amount from OutstandingBalance, so showing it
+// here too is just an honest record, not a double-count risk.
+module.exports.getCustomerPayments = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const customerCheck = await pool.query(
+      `SELECT "CustomerID" FROM "Customer" WHERE "CustomerID" = $1 AND "RegistrationID" = $2`,
+      [id, req.user.RegistrationID]
+    );
+    if (customerCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT s.* FROM "Sale" s
+       JOIN "TransactionType" tt ON tt."TransactionTypeID" = s."TransactionTypeID"
+       WHERE s."CustomerID" = $1 AND tt."Code" = 'RECEIVE_PAYMENT'
+       ORDER BY s."SaleDate" DESC`,
+      [id]
+    );
+
+    return res.json({ success: true, payments: result.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: "Error fetching payments" });
+  }
+};
+
 module.exports.getSales = async (req, res) => {
   try {
     const { storeId } = req.query;

@@ -1,11 +1,10 @@
-const {
-  getCustomers,
-  createCustomer,
-  updateCustomer,
-  deleteCustomer,
-  recordCustomerPayment,
-  getCustomerPayments,
-} = require("../Controllers/Customer");
+const { getCustomers, createCustomer, updateCustomer, deleteCustomer } = require("../Controllers/Customer");
+// recordCustomerPayment/getCustomerPayments live in Sale's controller,
+// not Customer's — a recorded payment is an actual Sale row (see
+// Controllers/Sale.js's recordCustomerPayment for why). Still exposed
+// under /customers/:id/payments, since that's the right REST resource
+// from the caller's point of view regardless of backend storage.
+const { recordCustomerPayment, getCustomerPayments } = require("../Controllers/Sale");
 const auth = require("../Middleware/auth");
 const requirePermission = require("../Middleware/requirePermission");
 
