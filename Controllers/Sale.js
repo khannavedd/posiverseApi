@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const pool = require("../DB/postgres");
 const { formatTransactionNumber } = require("../Utils/numberingFormat");
 const { publishSaleEvent } = require("../Utils/publishEvent");
+const { publishAfterCommit } = require("../Utils/publishAfterCommit");
 
 // Same shape/purpose as Controllers/Purchase.js's computeItems — looks
 // up every Tax row referenced by the line items in one go, validates
@@ -296,6 +297,31 @@ async function assertStockAvailable(client, storeId, preparedItems, existingItem
   return null;
 }
 
+// Re-reads a sale previously created under this idempotency key, in the
+// same shape createSale's success response has, so a retry is
+// indistinguishable from the original call apart from the
+// `idempotentReplay` flag.
+//
+// Returns null when the key has never been seen, which is the signal to
+// go ahead and create the sale.
+async function returnExistingSale(client, storeId, idempotencyKey) {
+  const existing = await client.query(
+    `SELECT * FROM "Sale" WHERE "StoreID" = $1 AND "IdempotencyKey" = $2`,
+    [storeId, idempotencyKey]
+  );
+  if (existing.rows.length === 0) return null;
+
+  const sale = existing.rows[0];
+  const items = await client.query(
+    `SELECT si.*, pr."Name" AS "ProductName", pr."SKU", pr."Barcode"
+     FROM "SaleItem" si
+     JOIN "Product" pr ON pr."ProductID" = si."ProductID"
+     WHERE si."SaleID" = $1`,
+    [sale.SaleID]
+  );
+  return { success: true, sale, items: items.rows };
+}
+
 async function insertSaleItems(client, saleId, preparedItems) {
   for (const item of preparedItems) {
     await client.query(
@@ -353,6 +379,21 @@ module.exports.createSale = async (req, res) => {
     if (!storeId) return res.status(400).json({ success: false, message: "storeId is required" });
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: "At least one item is required" });
+    }
+
+    // One key per checkout attempt, reused across retries of that
+    // attempt — see migration 034. Optional: a caller that doesn't send
+    // it gets the old unprotected behaviour rather than being refused,
+    // so an older app build keeps working.
+    const idempotencyKey = req.headers["idempotency-key"] || null;
+
+    // Fast path — the common retry, where the original request already
+    // finished and committed. The unique index below is what makes this
+    // actually safe (this check alone would be a check-then-act race);
+    // this just avoids doing all the work again in the usual case.
+    if (idempotencyKey) {
+      const replay = await returnExistingSale(client, storeId, idempotencyKey);
+      if (replay) return res.json({ ...replay, idempotentReplay: true });
     }
 
     await client.query("BEGIN");
@@ -493,11 +534,11 @@ module.exports.createSale = async (req, res) => {
         ("SaleID", "StoreID", "InvoiceNumber", "CustomerID", "TransactionTypeID", "SaleDate", "CashierID",
          "Subtotal", "DiscountAmount", "TaxAmount", "AdditionalCharges", "RoundOff", "TotalAmount", "TotalQty",
          "PaymentMethod", "PaymentStatus", "DueAmount", "Status", "RefNo", "Notes",
-         "Action", "ActionBy", "ActionByUID", "ActionOn")
+         "Action", "ActionBy", "ActionByUID", "ActionOn", "IdempotencyKey")
        VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()), $7,
          $8, $9, $10, $11, $12, $13, $14,
          $15, $16, $17, 'completed', $18, $19,
-         'NEW', $20, $21, now())
+         'NEW', $20, $21, now(), $22)
        RETURNING *`,
       [
         saleId,
@@ -521,6 +562,7 @@ module.exports.createSale = async (req, res) => {
         notes || null,
         req.user.Name || req.user.Email || null,
         req.user.UserID || null,
+        idempotencyKey,
       ]
     );
     const sale = saleResult.rows[0];
@@ -536,15 +578,27 @@ module.exports.createSale = async (req, res) => {
     // onSaleCreateUpdateInStock.js and the new customerDue.js).
     await client.query("COMMIT");
 
-    await publishSaleEvent({
-      eventType: "SaleCreated",
-      sale,
-      items: preparedItems,
-    });
+    const synced = await publishAfterCommit(
+      () => publishSaleEvent({ eventType: "SaleCreated", sale, items: preparedItems }),
+      `SaleCreated for invoice ${sale.InvoiceNumber} (SaleID ${sale.SaleID})`
+    );
 
-    return res.json({ success: true, sale, items: preparedItems });
+    return res.json({ success: true, sale, items: preparedItems, stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
+
+    // Two retries of the same checkout arriving close enough together
+    // that both passed the pre-check above and both tried to insert.
+    // The unique index on ("StoreID","IdempotencyKey") let exactly one
+    // through; this is the loser, so hand back the winner's sale rather
+    // than reporting a failure for a sale that demonstrably exists.
+    // This — not the pre-check — is what actually makes retries safe.
+    if (error.code === "23505" && error.constraint === "idx_sale_idempotency_key") {
+      const key = req.headers["idempotency-key"];
+      const winner = await returnExistingSale(client, req.body.storeId, key);
+      if (winner) return res.json({ ...winner, idempotentReplay: true });
+    }
+
     console.error(error);
     return res.status(500).json({ success: false, message: "Error creating sale" });
   } finally {
@@ -718,15 +772,18 @@ module.exports.updateSale = async (req, res) => {
 
     await client.query("COMMIT");
 
-    await publishSaleEvent({
-      eventType: "SaleUpdated",
-      sale: updateResult.rows[0],
-      items: preparedItems,
-      beforeSale: existing,
-      beforeItems: oldItems,
-    });
+    const synced = await publishAfterCommit(
+      () => publishSaleEvent({
+        eventType: "SaleUpdated",
+        sale: updateResult.rows[0],
+        items: preparedItems,
+        beforeSale: existing,
+        beforeItems: oldItems,
+      }),
+      `SaleUpdated for invoice ${existing.InvoiceNumber} (SaleID ${id})`
+    );
 
-    return res.json({ success: true, sale: updateResult.rows[0], items: preparedItems });
+    return res.json({ success: true, sale: updateResult.rows[0], items: preparedItems, stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -795,15 +852,18 @@ module.exports.cancelSale = async (req, res) => {
 
     await client.query("COMMIT");
 
-    await publishSaleEvent({
-      eventType: "SaleUpdated",
-      sale: updateResult.rows[0],
-      items: [],
-      beforeSale: existing,
-      beforeItems: existingItems,
-    });
+    const synced = await publishAfterCommit(
+      () => publishSaleEvent({
+        eventType: "SaleUpdated",
+        sale: updateResult.rows[0],
+        items: [],
+        beforeSale: existing,
+        beforeItems: existingItems,
+      }),
+      `SaleUpdated (cancel) for invoice ${existing.InvoiceNumber} (SaleID ${id})`
+    );
 
-    return res.json({ success: true, sale: updateResult.rows[0] });
+    return res.json({ success: true, sale: updateResult.rows[0], stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -855,6 +915,17 @@ module.exports.recordCustomerPayment = async (req, res) => {
       }
     }
     const totalAmount = preparedPayments.reduce((sum, p) => sum + p.amount, 0);
+
+    // A payment IS a Sale row (RECEIVE_PAYMENT type — see DEC-017), so
+    // it reuses Sale.IdempotencyKey and the index migration 034 already
+    // created; no separate column is needed. Without this a retried
+    // payment would double-credit the customer's balance.
+    const idempotencyKey = req.headers["idempotency-key"] || null;
+
+    if (idempotencyKey) {
+      const replay = await returnExistingSale(client, storeId, idempotencyKey);
+      if (replay) return res.json({ success: true, sale: replay.sale, idempotentReplay: true });
+    }
 
     await client.query("BEGIN");
 
@@ -950,11 +1021,11 @@ module.exports.recordCustomerPayment = async (req, res) => {
         ("SaleID", "StoreID", "InvoiceNumber", "CustomerID", "TransactionTypeID", "SaleDate", "CashierID",
          "Subtotal", "DiscountAmount", "TaxAmount", "AdditionalCharges", "RoundOff", "TotalAmount", "TotalQty",
          "PaymentMethod", "PaymentStatus", "DueAmount", "Status", "RefNo", "Notes",
-         "Action", "ActionBy", "ActionByUID", "ActionOn")
+         "Action", "ActionBy", "ActionByUID", "ActionOn", "IdempotencyKey")
        VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()), $7,
          $8, 0, 0, 0, 0, $8, 0,
          $9, 'paid', 0, 'completed', $10, $11,
-         'NEW', $12, $13, now())
+         'NEW', $12, $13, now(), $14)
        RETURNING *`,
       [
         saleId,
@@ -970,6 +1041,7 @@ module.exports.recordCustomerPayment = async (req, res) => {
         notes || null,
         req.user.Name || req.user.Email || null,
         req.user.UserID || null,
+        idempotencyKey,
       ]
     );
     const sale = saleResult.rows[0];
@@ -979,11 +1051,23 @@ module.exports.recordCustomerPayment = async (req, res) => {
 
     await client.query("COMMIT");
 
-    await publishSaleEvent({ eventType: "SaleCreated", sale, items: [] });
+    const synced = await publishAfterCommit(
+      () => publishSaleEvent({ eventType: "SaleCreated", sale, items: [] }),
+      `SaleCreated (customer payment) ${sale.InvoiceNumber} for CustomerID ${customerId}`
+    );
 
-    return res.json({ success: true, sale });
+    return res.json({ success: true, sale, balanceSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
+
+    // Concurrent retries of the same payment — same reasoning as
+    // createSale's; the unique index is what actually guarantees one.
+    if (error.code === "23505" && error.constraint === "idx_sale_idempotency_key") {
+      const key = req.headers["idempotency-key"];
+      const winner = await returnExistingSale(client, req.body.storeId, key);
+      if (winner) return res.json({ success: true, sale: winner.sale, idempotentReplay: true });
+    }
+
     console.error(error);
     return res.status(500).json({ success: false, message: "Error recording payment" });
   } finally {
@@ -1085,9 +1169,355 @@ module.exports.getSale = async (req, res) => {
       [id]
     );
 
-    return res.json({ success: true, sale: saleResult.rows[0], items: itemsResult.rows, payments: paymentsResult.rows });
+    // Returns already recorded against this sale, so the client can
+    // show what's left returnable and SaleView can say "partly
+    // returned" rather than looking untouched.
+    const returnsResult = await pool.query(
+      `SELECT s."SaleID", s."InvoiceNumber", s."SaleDate", s."TotalAmount", s."Status",
+              si."ProductID", si."Quantity"
+       FROM "Sale" s
+       JOIN "SaleItem" si ON si."SaleID" = s."SaleID"
+       WHERE s."ReturnOfSaleID" = $1 AND s."Status" != 'cancelled'`,
+      [id]
+    );
+
+    // Collapsed to "how much of each product has come back", which is
+    // the shape the Return screen actually needs to cap its inputs.
+    const returnedByProduct = {};
+    for (const row of returnsResult.rows) {
+      returnedByProduct[row.ProductID] = (returnedByProduct[row.ProductID] || 0) + Number(row.Quantity);
+    }
+
+    return res.json({
+      success: true,
+      sale: saleResult.rows[0],
+      items: itemsResult.rows,
+      payments: paymentsResult.rows,
+      returnedByProduct,
+    });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ success: false, message: "Error fetching sale" });
+  }
+};
+
+// Records a return against a posted sale.
+//
+// A return is an ordinary "Sale" row under the SALE_RETURN
+// TransactionType — the same modelling choice DEC-017 made for Receive
+// Payment. That buys a lot for free:
+//   * Direction 'in' on that type means posiverse-engine's existing
+//     InStock consumer ADDS the returned quantities back with no code
+//     change at all.
+//   * Its own SaleItem rows carry per-product quantities, so a partial
+//     return (1 of 3) is just a return document with smaller lines.
+//   * It gets a real DocumentSeries number and shows up wherever sales
+//     do.
+//
+// Settlement is one of two, and the difference is only in how the money
+// is recorded:
+//   "refund"  — a SalePayment row on the return. Cash back out of the
+//               drawer. The only option for a walk-in, since there's no
+//               account to credit.
+//   "credit"  — no payment row; the return's TotalAmount reduces the
+//               customer's OutstandingBalance instead (applied by
+//               posiverse-engine's customerDue consumer). Requires a
+//               customer. If they owed nothing they end up in credit,
+//               which the app already renders as "In credit".
+module.exports.createSaleReturn = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { items, settlement, refundMethod, notes } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, message: "Pick at least one item to return" });
+    }
+    if (!["refund", "credit"].includes(settlement)) {
+      return res.status(400).json({ success: false, message: "settlement must be 'refund' or 'credit'" });
+    }
+
+    const idempotencyKey = req.headers["idempotency-key"] || null;
+
+    await client.query("BEGIN");
+
+    // Lock the original sale for the duration — the over-return guard
+    // below reads what's already been returned against it, and without
+    // this two concurrent returns could each see the same "already
+    // returned" figure and together exceed what was sold.
+    const originalResult = await client.query(
+      `SELECT s.* FROM "Sale" s
+       JOIN "Store" st ON st."StoreID" = s."StoreID"
+       WHERE s."SaleID" = $1 AND st."RegistrationID" = $2
+       FOR UPDATE OF s`,
+      [id, req.user.RegistrationID]
+    );
+    if (originalResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Sale not found" });
+    }
+    const original = originalResult.rows[0];
+
+    if (original.Status === "cancelled") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "This sale was cancelled — there's nothing to return." });
+    }
+
+    if (idempotencyKey) {
+      const replay = await returnExistingSale(client, original.StoreID, idempotencyKey);
+      if (replay) {
+        await client.query("ROLLBACK");
+        return res.json({ ...replay, idempotentReplay: true });
+      }
+    }
+
+    if (settlement === "credit" && !original.CustomerID) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: "This was a walk-in sale — there's no account to credit. Refund it instead.",
+      });
+    }
+
+    // What was originally sold, and what has already come back.
+    const soldResult = await client.query(`SELECT * FROM "SaleItem" WHERE "SaleID" = $1`, [id]);
+    const soldByProduct = {};
+    for (const row of soldResult.rows) {
+      soldByProduct[row.ProductID] = {
+        qty: (soldByProduct[row.ProductID]?.qty || 0) + Number(row.Quantity),
+        unitPrice: Number(row.UnitPrice),
+        discountAmount: Number(row.DiscountAmount) || 0,
+        taxId: row.TaxID,
+        taxInclusive: row.TaxInclusive,
+      };
+    }
+
+    const priorResult = await client.query(
+      `SELECT si."ProductID", SUM(si."Quantity") AS qty
+       FROM "Sale" s JOIN "SaleItem" si ON si."SaleID" = s."SaleID"
+       WHERE s."ReturnOfSaleID" = $1 AND s."Status" != 'cancelled'
+       GROUP BY si."ProductID"`,
+      [id]
+    );
+    const alreadyReturned = Object.fromEntries(priorResult.rows.map(r => [r.ProductID, Number(r.qty)]));
+
+    // Build the return's line items from the ORIGINAL sale's prices, not
+    // from anything the request sends. A refund must be for what was
+    // actually charged — letting the client state a price would let a
+    // return refund more than the sale collected.
+    const returnItems = [];
+    for (const item of items) {
+      const qty = Number(item.qty);
+      const sold = soldByProduct[item.productId];
+
+      if (!sold) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, message: "That item wasn't on this sale." });
+      }
+      if (!Number.isFinite(qty) || qty <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, message: "Each returned item needs a quantity above zero." });
+      }
+
+      const returnable = sold.qty - (alreadyReturned[item.productId] || 0);
+      if (qty > returnable) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          message:
+            returnable <= 0
+              ? "That item has already been fully returned."
+              : `Only ${returnable} of that item can still be returned.`,
+        });
+      }
+
+      // The line's discount is pro-rated across the returned quantity,
+      // so returning 1 of 3 discounted units refunds a third of that
+      // line's discount rather than the full undiscounted price.
+      returnItems.push({
+        productId: item.productId,
+        qty,
+        unitPrice: sold.unitPrice,
+        discountAmount: (sold.discountAmount / sold.qty) * qty,
+        taxId: sold.taxId,
+        taxInclusive: sold.taxInclusive,
+      });
+    }
+
+    // Reuse computeItems so the return's tax/line math is identical to
+    // the sale's — same function, same rounding, no second
+    // implementation to drift.
+    const computed = await computeItems(
+      client,
+      returnItems.map(r => ({
+        productId: r.productId,
+        qty: r.qty,
+        unitPrice: r.unitPrice,
+        discountAmount: r.discountAmount,
+        taxId: r.taxId,
+        taxInclusive: r.taxInclusive,
+      })),
+      req.user.RegistrationID
+    );
+    if (computed.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: computed.error });
+    }
+    const { preparedItems, subtotal, totalQty, taxAmountTotal, lineTotalSum } = computed;
+
+    const totalAmount = deriveTotalAmount({
+      lineTotalSum,
+      headerDiscount: 0,
+      additionalCharges: 0,
+      roundOff: 0,
+    });
+
+    const totalCheck = assertTotalMatchesLines({
+      totalAmount,
+      lineTotalSum,
+      headerDiscount: 0,
+      additionalCharges: 0,
+      roundOff: 0,
+    });
+    if (totalCheck?.error) {
+      await client.query("ROLLBACK");
+      console.error("createSaleReturn:", totalCheck.error);
+      return res.status(500).json({ success: false, message: "Return totals didn't balance — nothing was saved." });
+    }
+
+    const txnTypeResult = await client.query(
+      `SELECT * FROM "TransactionType"
+       WHERE "RegistrationID" = $1 AND "Code" = 'SALE_RETURN' AND "IsActive" = true`,
+      [req.user.RegistrationID]
+    );
+    if (txnTypeResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: "Sales Return transaction type isn't set up for this business" });
+    }
+    const transactionType = txnTypeResult.rows[0];
+
+    const storeResult = await client.query(`SELECT "StoreCode" FROM "Store" WHERE "StoreID" = $1`, [original.StoreID]);
+    const cashRegisterResult = await client.query(
+      `SELECT "Code" FROM "CashRegister" WHERE "StoreID" = $1 AND "IsActive" = true ORDER BY "CreatedAt" ASC LIMIT 1`,
+      [original.StoreID]
+    );
+
+    // Same lock/increment/format sequence createSale uses, against this
+    // type's own series so returns number independently of invoices.
+    let seriesResult = await client.query(
+      `SELECT * FROM "DocumentSeries"
+       WHERE "StoreID" = $1 AND "TransactionTypeID" = $2 AND "CashRegisterID" IS NULL
+       FOR UPDATE`,
+      [original.StoreID, transactionType.TransactionTypeID]
+    );
+    let series;
+    if (seriesResult.rows.length === 0) {
+      try {
+        const inserted = await client.query(
+          `INSERT INTO "DocumentSeries"
+            ("DocumentSeriesID", "StoreID", "TransactionTypeID", "CurrentNumber", "IsActive")
+           VALUES ($1, $2, $3, 0, true) RETURNING *`,
+          [crypto.randomUUID(), original.StoreID, transactionType.TransactionTypeID]
+        );
+        series = inserted.rows[0];
+      } catch (insertError) {
+        if (insertError.code === "23505") {
+          const retry = await client.query(
+            `SELECT * FROM "DocumentSeries"
+             WHERE "StoreID" = $1 AND "TransactionTypeID" = $2 AND "CashRegisterID" IS NULL
+             FOR UPDATE`,
+            [original.StoreID, transactionType.TransactionTypeID]
+          );
+          series = retry.rows[0];
+        } else {
+          throw insertError;
+        }
+      }
+    } else {
+      series = seriesResult.rows[0];
+    }
+
+    const nextNumber = series.CurrentNumber + 1;
+    await client.query(`UPDATE "DocumentSeries" SET "CurrentNumber" = $1 WHERE "DocumentSeriesID" = $2`, [
+      nextNumber,
+      series.DocumentSeriesID,
+    ]);
+    const returnNumber = formatTransactionNumber(transactionType.NumberingFormat, {
+      code: transactionType.Code,
+      storeCode: storeResult.rows[0]?.StoreCode,
+      cashRegisterCode: cashRegisterResult.rows[0]?.Code || null,
+      runningNumber: nextNumber,
+    });
+
+    // PaymentMethod/PaymentStatus describe how the return was settled.
+    // A credit return has no payment rows at all — the money moves on
+    // the customer's balance instead, applied by customerDue.
+    const isRefund = settlement === "refund";
+    const returnId = crypto.randomUUID();
+    const returnResult = await client.query(
+      `INSERT INTO "Sale"
+        ("SaleID", "StoreID", "InvoiceNumber", "CustomerID", "TransactionTypeID", "SaleDate", "CashierID",
+         "Subtotal", "DiscountAmount", "TaxAmount", "AdditionalCharges", "RoundOff", "TotalAmount", "TotalQty",
+         "PaymentMethod", "PaymentStatus", "DueAmount", "Status", "RefNo", "Notes",
+         "Action", "ActionBy", "ActionByUID", "ActionOn", "IdempotencyKey", "ReturnOfSaleID")
+       VALUES ($1, $2, $3, $4, $5, now(), $6,
+         $7, 0, $8, 0, 0, $9, $10,
+         $11, 'paid', 0, 'completed', $12, $13,
+         'NEW', $14, $15, now(), $16, $17)
+       RETURNING *`,
+      [
+        returnId,
+        original.StoreID,
+        returnNumber,
+        original.CustomerID,
+        transactionType.TransactionTypeID,
+        req.user.UserID || null,
+        subtotal,
+        taxAmountTotal,
+        totalAmount,
+        totalQty,
+        isRefund ? refundMethod || "Cash" : "Credit to account",
+        original.InvoiceNumber,
+        notes || null,
+        req.user.Name || req.user.Email || null,
+        req.user.UserID || null,
+        idempotencyKey,
+        id,
+      ]
+    );
+    const saleReturn = returnResult.rows[0];
+
+    await insertSaleItems(client, returnId, preparedItems);
+
+    if (isRefund) {
+      await insertSalePayments(client, returnId, [
+        { method: refundMethod || "Cash", amount: totalAmount },
+      ]);
+    }
+
+    await client.query("COMMIT");
+
+    // Direction 'in' on SALE_RETURN means the existing InStock consumer
+    // adds the quantities back; customerDue applies the credit when
+    // this was settled that way.
+    const synced = await publishAfterCommit(
+      () => publishSaleEvent({ eventType: "SaleCreated", sale: saleReturn, items: preparedItems }),
+      `SaleCreated (return) ${returnNumber} against ${original.InvoiceNumber}`
+    );
+
+    return res.json({ success: true, sale: saleReturn, items: preparedItems, stockSyncPending: !synced });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    if (error.code === "23505" && error.constraint === "idx_sale_idempotency_key") {
+      const key = req.headers["idempotency-key"];
+      const winner = await returnExistingSale(client, req.body.storeId, key);
+      if (winner) return res.json({ ...winner, idempotentReplay: true });
+    }
+
+    console.error(error);
+    return res.status(500).json({ success: false, message: "Error recording return" });
+  } finally {
+    client.release();
   }
 };

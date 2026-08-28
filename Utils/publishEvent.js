@@ -103,6 +103,11 @@ function saleSnapshot(sale) {
     // apply it to Customer.OutstandingBalance.
     TotalAmount: sale.TotalAmount,
     Status: sale.Status,
+    // customerDue needs this to tell a SALE_RETURN settled as "credit
+    // to account" (balance goes down) from one settled as a cash refund
+    // (money already handed back at the till — the balance must NOT
+    // also move, or the customer is credited twice). See DEC-021.
+    PaymentMethod: sale.PaymentMethod,
   };
 }
 

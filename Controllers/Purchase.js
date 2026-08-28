@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const pool = require("../DB/postgres");
 const { formatTransactionNumber } = require("../Utils/numberingFormat");
 const { publishPurchaseEvent } = require("../Utils/publishEvent");
+const { publishAfterCommit } = require("../Utils/publishAfterCommit");
 
 // Shared by createPurchase and updatePurchase — looks up every Tax row
 // referenced by the line items in one go (so each item's tax split is
@@ -135,6 +136,27 @@ function assertTotalMatchesLines({ totalAmount, lineTotalSum, headerDiscount, ad
   return null;
 }
 
+// Re-reads a purchase previously created under this idempotency key, in
+// the same shape createPurchase's success response has. Mirrors
+// Controllers/Sale.js's returnExistingSale — see migration 035.
+async function returnExistingPurchase(client, storeId, idempotencyKey) {
+  const existing = await client.query(
+    `SELECT * FROM "Purchase" WHERE "StoreID" = $1 AND "IdempotencyKey" = $2`,
+    [storeId, idempotencyKey]
+  );
+  if (existing.rows.length === 0) return null;
+
+  const purchase = existing.rows[0];
+  const items = await client.query(
+    `SELECT pi.*, pr."Name" AS "ProductName", pr."SKU", pr."Barcode"
+     FROM "PurchaseItem" pi
+     JOIN "Product" pr ON pr."ProductID" = pi."ProductID"
+     WHERE pi."PurchaseID" = $1`,
+    [purchase.PurchaseID]
+  );
+  return { success: true, purchase, items: items.rows };
+}
+
 async function insertPurchaseItems(client, purchaseId, preparedItems) {
   for (const item of preparedItems) {
     await client.query(
@@ -191,6 +213,15 @@ module.exports.createPurchase = async (req, res) => {
     if (!vendorId) return res.status(400).json({ success: false, message: "vendorId is required" });
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: "At least one item is required" });
+    }
+
+    // One key per save attempt, reused across retries of that attempt —
+    // see migration 035. Optional, so an older app build still works.
+    const idempotencyKey = req.headers["idempotency-key"] || null;
+
+    if (idempotencyKey) {
+      const replay = await returnExistingPurchase(client, storeId, idempotencyKey);
+      if (replay) return res.json({ ...replay, idempotentReplay: true });
     }
 
     await client.query("BEGIN");
@@ -342,11 +373,11 @@ module.exports.createPurchase = async (req, res) => {
         ("PurchaseID", "StoreID", "VendorID", "TransactionTypeID", "TransactionNo", "TransactionDate",
          "Status", "RefNo", "Notes", "Subtotal", "DiscountAmount", "TaxAmount", "AdditionalCharges",
          "RoundOff", "TotalAmount", "TotalQty", "PaymentStatus", "DueAmount",
-         "Action", "ActionBy", "ActionByUID", "ActionOn")
+         "Action", "ActionBy", "ActionByUID", "ActionOn", "IdempotencyKey")
        VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()),
          'completed', $7, $8, $9, $10, $11, $12,
          $13, $14, $15, $16, $17,
-         'NEW', $18, $19, now())
+         'NEW', $18, $19, now(), $20)
        RETURNING *`,
       [
         purchaseId,
@@ -368,6 +399,7 @@ module.exports.createPurchase = async (req, res) => {
         dueAmount,
         req.user.Name || req.user.Email || null,
         req.user.UserID || null,
+        idempotencyKey,
       ]
     );
 
@@ -380,18 +412,33 @@ module.exports.createPurchase = async (req, res) => {
     // inline as part of handling this request.
     await client.query("COMMIT");
 
-    // Published straight to Pub/Sub, after commit, awaited — see
-    // Utils/publishEvent.js for what this does and doesn't guarantee
-    // now that there's no outbox table backstopping it.
-    await publishPurchaseEvent({
-      eventType: "PurchaseCreated",
-      purchase: purchaseResult.rows[0],
-      items: preparedItems,
-    });
+    // Published after commit, and deliberately OUTSIDE this handler's
+    // error path — see Utils/publishAfterCommit.js. A Pub/Sub outage
+    // must not be reported as a failed purchase, because the purchase
+    // is already durable at this point.
+    const synced = await publishAfterCommit(
+      () => publishPurchaseEvent({
+        eventType: "PurchaseCreated",
+        purchase: purchaseResult.rows[0],
+        items: preparedItems,
+      }),
+      `PurchaseCreated ${purchaseResult.rows[0].TransactionNo} (PurchaseID ${purchaseResult.rows[0].PurchaseID})`
+    );
 
-    return res.json({ success: true, purchase: purchaseResult.rows[0], items: preparedItems });
+    return res.json({ success: true, purchase: purchaseResult.rows[0], items: preparedItems, stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
+
+    // Concurrent retries of the same save — the unique index let one
+    // through, so hand back the winner rather than reporting a failure
+    // for a purchase that exists. This, not the pre-check above, is what
+    // actually makes retries safe. Same shape as createSale's.
+    if (error.code === "23505" && error.constraint === "idx_purchase_idempotency_key") {
+      const key = req.headers["idempotency-key"];
+      const winner = await returnExistingPurchase(client, req.body.storeId, key);
+      if (winner) return res.json({ ...winner, idempotentReplay: true });
+    }
+
     console.error(error);
     return res.status(500).json({ success: false, message: "Error creating purchase" });
   } finally {
@@ -550,15 +597,18 @@ module.exports.updatePurchase = async (req, res) => {
 
     await client.query("COMMIT");
 
-    await publishPurchaseEvent({
-      eventType: "PurchaseUpdated",
-      purchase: updateResult.rows[0],
-      items: preparedItems,
-      beforePurchase: existing,
-      beforeItems: oldItems,
-    });
+    const synced = await publishAfterCommit(
+      () => publishPurchaseEvent({
+        eventType: "PurchaseUpdated",
+        purchase: updateResult.rows[0],
+        items: preparedItems,
+        beforePurchase: existing,
+        beforeItems: oldItems,
+      }),
+      `PurchaseUpdated ${existing.TransactionNo} (PurchaseID ${id})`
+    );
 
-    return res.json({ success: true, purchase: updateResult.rows[0], items: preparedItems });
+    return res.json({ success: true, purchase: updateResult.rows[0], items: preparedItems, stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -631,15 +681,18 @@ module.exports.cancelPurchase = async (req, res) => {
 
     await client.query("COMMIT");
 
-    await publishPurchaseEvent({
-      eventType: "PurchaseUpdated",
-      purchase: updateResult.rows[0],
-      items: [],
-      beforePurchase: existing,
-      beforeItems: existingItems,
-    });
+    const synced = await publishAfterCommit(
+      () => publishPurchaseEvent({
+        eventType: "PurchaseUpdated",
+        purchase: updateResult.rows[0],
+        items: [],
+        beforePurchase: existing,
+        beforeItems: existingItems,
+      }),
+      `PurchaseUpdated (cancel) ${existing.TransactionNo} (PurchaseID ${id})`
+    );
 
-    return res.json({ success: true, purchase: updateResult.rows[0] });
+    return res.json({ success: true, purchase: updateResult.rows[0], stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);

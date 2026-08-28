@@ -102,6 +102,28 @@ function normalizeAttributes(attributes) {
 // ParentProductID for the list view. Same visibility rule as before: a
 // row is visible if it's a store-specific row for this store, or a
 // shared row for the business.
+// Turns a unique-index violation from migration 036 into the same
+// friendly message the pre-INSERT check produces.
+//
+// That check (a SELECT before the INSERT) is a check-then-act race:
+// two concurrent creates both see no conflict and both proceed. The
+// index is what actually guarantees uniqueness, so this is the path
+// that matters — the pre-check just produces a nicer message in the
+// common, uncontended case.
+//
+// Returns null when the error isn't one of ours, so the caller falls
+// through to its normal 500.
+function duplicateFieldMessage(error) {
+  if (error?.code !== "23505") return null;
+  if (error.constraint === "idx_product_sku_unique") {
+    return "That SKU is already used by another product.";
+  }
+  if (error.constraint === "idx_product_barcode_unique") {
+    return "That barcode is already used by another product.";
+  }
+  return null;
+}
+
 module.exports.getProducts = async (req, res) => {
   try {
     const { storeId, updatedSince } = req.query;
@@ -380,6 +402,9 @@ module.exports.createProduct = async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
+    const duplicate = duplicateFieldMessage(error);
+    if (duplicate) return res.status(400).json({ success: false, message: duplicate });
+
     return res.status(500).json({ success: false, message: "Error creating product" });
   } finally {
     client.release();
@@ -630,6 +655,9 @@ module.exports.updateProduct = async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
+    const duplicate = duplicateFieldMessage(error);
+    if (duplicate) return res.status(400).json({ success: false, message: duplicate });
+
     return res.status(500).json({ success: false, message: "Error updating product" });
   } finally {
     client.release();
