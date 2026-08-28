@@ -17,15 +17,29 @@ const { publishSaleEvent } = require("../Utils/publishEvent");
 async function computeItems(client, items, registrationId) {
   const productIds = [...new Set(items.map(i => i.productId).filter(Boolean))];
   let ownedProductIds = new Set();
+  // TaxID/TaxInclusive now come back too — they are the source of truth
+  // for a line's tax treatment, not whatever the client sent. See the
+  // override handling further down.
+  let productById = {};
   if (productIds.length > 0) {
     const productResult = await client.query(
-      `SELECT "ProductID" FROM "Product" WHERE "ProductID" = ANY($1::uuid[]) AND "RegistrationID" = $2`,
+      `SELECT "ProductID", "Name", "TaxID", "TaxInclusive" FROM "Product"
+       WHERE "ProductID" = ANY($1::uuid[]) AND "RegistrationID" = $2`,
       [productIds, registrationId]
     );
     ownedProductIds = new Set(productResult.rows.map(r => r.ProductID));
+    productById = Object.fromEntries(productResult.rows.map(p => [p.ProductID, p]));
   }
 
-  const taxIds = [...new Set(items.map(i => i.taxId).filter(Boolean))];
+  // Includes the taxes the *products* carry, not just any the request
+  // named — a line that sends no taxId falls back to its product's tax
+  // below, and that tax still has to be loaded here to be applied.
+  const taxIds = [
+    ...new Set([
+      ...items.map(i => i.taxId),
+      ...Object.values(productById).map(p => p.TaxID),
+    ].filter(Boolean)),
+  ];
   let taxById = {};
   if (taxIds.length > 0) {
     const taxResult = await client.query(
@@ -39,6 +53,11 @@ async function computeItems(client, items, registrationId) {
   let totalQty = 0;
   let lineDiscountTotal = 0;
   let taxAmountTotal = 0;
+  // The sum the header total is actually built from — see the return
+  // below. Accumulated here rather than re-derived from subtotal/tax,
+  // because only the per-line figure knows whether its tax was
+  // inclusive (already inside the price) or exclusive (added on top).
+  let lineTotalSum = 0;
   const preparedItems = [];
 
   for (const item of items) {
@@ -54,12 +73,37 @@ async function computeItems(client, items, registrationId) {
       return { error: "One or more selected taxes aren't available" };
     }
 
+    // A line's tax treatment DEFAULTS to the product's own, but the
+    // request may change it — an explicit decision (see DEC-018): the
+    // till needs to be able to sell the same product with different tax
+    // treatment when the situation calls for it, so this is not
+    // permission-gated.
+    //
+    // What did change is the default. Previously an omitted taxId meant
+    // "no tax" and an omitted taxInclusive meant "exclusive", so a
+    // client that simply didn't send them silently sold taxable goods
+    // untaxed. Now anything the request doesn't state is taken from the
+    // Product row, and only a value it actually sends overrides that.
+    //
+    // Worth knowing when reading a stored SaleItem: its TaxID/
+    // TaxInclusive are a snapshot of what was applied at sale time, and
+    // may legitimately differ from the product's current values —
+    // either because the product was edited later, or because this line
+    // was overridden.
+    const product = productById[item.productId];
+    const productTaxId = product?.TaxID ?? null;
+    const productTaxInclusive = !!product?.TaxInclusive;
+
+    const requestedTaxId = item.taxId === undefined ? productTaxId : (item.taxId || null);
+    const requestedTaxInclusive =
+      item.taxInclusive === undefined ? productTaxInclusive : !!item.taxInclusive;
+
     const lineDiscount = Number(item.discountAmount) || 0;
     const gross = qty * unitPrice;
     const taxableAmount = Math.max(gross - lineDiscount, 0);
 
-    const tax = item.taxId ? taxById[item.taxId] : null;
-    const taxInclusive = !!item.taxInclusive;
+    const tax = requestedTaxId ? taxById[requestedTaxId] : null;
+    const taxInclusive = requestedTaxInclusive;
     const taxPercentage = tax ? Number(tax.TotalPercentage) || 0 : 0;
 
     let taxAmount = 0;
@@ -75,6 +119,7 @@ async function computeItems(client, items, registrationId) {
     totalQty += qty;
     lineDiscountTotal += lineDiscount;
     taxAmountTotal += taxAmount;
+    lineTotalSum += lineTotal;
 
     preparedItems.push({
       productId: item.productId,
@@ -82,7 +127,7 @@ async function computeItems(client, items, registrationId) {
       unitPrice,
       mrp: item.mrp != null ? Number(item.mrp) : null,
       discountAmount: lineDiscount,
-      taxId: item.taxId || null,
+      taxId: requestedTaxId,
       taxInclusive,
       taxableAmount,
       taxAmount,
@@ -92,7 +137,47 @@ async function computeItems(client, items, registrationId) {
     });
   }
 
-  return { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal };
+  return { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal, lineTotalSum };
+}
+
+// The one place a header total is derived, so Sale and its line items
+// can never disagree. Callers pass the lineTotalSum computeItems
+// returned; everything else is header-level and applies once.
+//
+// Previously each caller did `subtotal - totalDiscount + taxAmountTotal`,
+// which double-counted tax on every tax-INCLUSIVE line: `subtotal` is
+// the gross (tax already inside, since an inclusive price contains it)
+// and `taxAmountTotal` then added that same tax a second time. A 3 x
+// Rs10 inclusive-5% cart stored 31.43 against line items summing to
+// 30.00 — the customer was overcharged the embedded tax and the Sale
+// row contradicted itself.
+//
+// Line-level discounts are deliberately NOT subtracted here: each
+// lineTotal is already net of its own discount (taxableAmount = gross -
+// lineDiscount). Only the header's own "additional discount" applies at
+// this level.
+//
+// Sale.Subtotal and Sale.TaxAmount are still stored, but as reporting
+// figures — TaxAmount is the tax extracted from inclusive prices and
+// added to exclusive ones, which is what GST reporting needs. Neither
+// participates in the total any more.
+function deriveTotalAmount({ lineTotalSum, headerDiscount, additionalCharges, roundOff }) {
+  return lineTotalSum - headerDiscount + additionalCharges + roundOff;
+}
+
+// Refuses to write a header that disagrees with its own line items.
+// Cheap, runs before COMMIT, and turns any future regression in the
+// totals math into a loud failure instead of silently wrong money.
+// One paisa of tolerance for float representation — see the float
+// reconciliation issue logged separately in the audit.
+function assertTotalMatchesLines({ totalAmount, lineTotalSum, headerDiscount, additionalCharges, roundOff }) {
+  const expected = lineTotalSum - headerDiscount + additionalCharges + roundOff;
+  if (Math.abs(totalAmount - expected) > 0.01) {
+    return {
+      error: `Total mismatch: header ${totalAmount.toFixed(2)} vs line items ${expected.toFixed(2)}`,
+    };
+  }
+  return null;
 }
 
 // Split-payment validation + the same paid/due/status derivation
@@ -364,7 +449,7 @@ module.exports.createSale = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, message: computed.error });
     }
-    const { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal } = computed;
+    const { preparedItems, subtotal, totalQty, taxAmountTotal, lineTotalSum } = computed;
 
     const stockCheck = await assertStockAvailable(client, storeId, preparedItems);
     if (stockCheck?.error) {
@@ -375,8 +460,25 @@ module.exports.createSale = async (req, res) => {
     const extraDiscount = Number(headerDiscount) || 0;
     const extraCharges = Number(additionalCharges) || 0;
     const roundOffAmount = Number(roundOff) || 0;
-    const totalDiscount = lineDiscountTotal + extraDiscount;
-    const totalAmount = subtotal - totalDiscount + taxAmountTotal + extraCharges + roundOffAmount;
+    const totalAmount = deriveTotalAmount({
+      lineTotalSum,
+      headerDiscount: extraDiscount,
+      additionalCharges: extraCharges,
+      roundOff: roundOffAmount,
+    });
+
+    const totalCheck = assertTotalMatchesLines({
+      totalAmount,
+      lineTotalSum,
+      headerDiscount: extraDiscount,
+      additionalCharges: extraCharges,
+      roundOff: roundOffAmount,
+    });
+    if (totalCheck?.error) {
+      await client.query("ROLLBACK");
+      console.error("createSale:", totalCheck.error);
+      return res.status(500).json({ success: false, message: "Sale totals didn't balance — nothing was saved." });
+    }
 
     const paymentResult = derivePayments({ payments, paymentMethod, totalAmount, customerId });
     if (paymentResult.error) {
@@ -517,7 +619,7 @@ module.exports.updateSale = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, message: computed.error });
     }
-    const { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal } = computed;
+    const { preparedItems, subtotal, totalQty, taxAmountTotal, lineTotalSum } = computed;
 
     // Fetched here (before the replace below) so assertStockAvailable
     // can compare against what THIS sale already holds, not just raw
@@ -539,8 +641,25 @@ module.exports.updateSale = async (req, res) => {
     const extraDiscount = Number(headerDiscount) || 0;
     const extraCharges = Number(additionalCharges) || 0;
     const roundOffAmount = Number(roundOff) || 0;
-    const totalDiscount = lineDiscountTotal + extraDiscount;
-    const totalAmount = subtotal - totalDiscount + taxAmountTotal + extraCharges + roundOffAmount;
+    const totalAmount = deriveTotalAmount({
+      lineTotalSum,
+      headerDiscount: extraDiscount,
+      additionalCharges: extraCharges,
+      roundOff: roundOffAmount,
+    });
+
+    const totalCheck = assertTotalMatchesLines({
+      totalAmount,
+      lineTotalSum,
+      headerDiscount: extraDiscount,
+      additionalCharges: extraCharges,
+      roundOff: roundOffAmount,
+    });
+    if (totalCheck?.error) {
+      await client.query("ROLLBACK");
+      console.error("updateSale:", totalCheck.error);
+      return res.status(500).json({ success: false, message: "Sale totals didn't balance — nothing was saved." });
+    }
 
     // Resolved the same way the UPDATE below actually writes CustomerID
     // (customerId || null — an edit that omits it clears the customer,

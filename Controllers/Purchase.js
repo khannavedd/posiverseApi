@@ -50,6 +50,10 @@ async function computeItems(client, items, registrationId) {
     taxById = Object.fromEntries(taxResult.rows.map(t => [t.TaxID, t]));
   }
 
+  // See deriveTotalAmount below — the header total is built from this,
+  // not from subtotal + taxAmountTotal, because only the per-line
+  // figure knows whether its tax was inclusive or exclusive.
+  let lineTotalSum = 0;
   let subtotal = 0;
   let totalQty = 0;
   let lineDiscountTotal = 0;
@@ -90,6 +94,7 @@ async function computeItems(client, items, registrationId) {
     totalQty += qty;
     lineDiscountTotal += lineDiscount;
     taxAmountTotal += taxAmount;
+    lineTotalSum += subTotal;
 
     preparedItems.push({
       productId: item.productId,
@@ -108,7 +113,26 @@ async function computeItems(client, items, registrationId) {
     });
   }
 
-  return { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal };
+  return { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal, lineTotalSum };
+}
+
+// Mirrors Controllers/Sale.js's deriveTotalAmount — see the long
+// comment there for why the header total is built from the per-line
+// figures instead of `subtotal + taxAmountTotal`. Same double-counting
+// bug existed here for tax-inclusive purchase lines, inflating what the
+// vendor appeared to be owed.
+function deriveTotalAmount({ lineTotalSum, headerDiscount, additionalCharges, roundOff }) {
+  return lineTotalSum - headerDiscount + additionalCharges + roundOff;
+}
+
+function assertTotalMatchesLines({ totalAmount, lineTotalSum, headerDiscount, additionalCharges, roundOff }) {
+  const expected = lineTotalSum - headerDiscount + additionalCharges + roundOff;
+  if (Math.abs(totalAmount - expected) > 0.01) {
+    return {
+      error: `Total mismatch: header ${totalAmount.toFixed(2)} vs line items ${expected.toFixed(2)}`,
+    };
+  }
+  return null;
 }
 
 async function insertPurchaseItems(client, purchaseId, preparedItems) {
@@ -271,24 +295,42 @@ module.exports.createPurchase = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, message: computed.error });
     }
-    const { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal } = computed;
+    const { preparedItems, subtotal, totalQty, taxAmountTotal, lineTotalSum } = computed;
 
     // extraDiscount ("Additional discount", typed once at the header)
-    // and lineDiscountTotal (the sum of every line's own Discount amt)
-    // are kept as two genuinely separate figures, matching how
-    // AdditionalCharges/RoundOff already stand alone rather than being
-    // folded into some other column. "Purchase"."DiscountAmount" stores
-    // ONLY extraDiscount — the header field's own value, nothing merged
-    // in — while the line-level total is never lost, it's just read
-    // back from the PurchaseItem rows themselves (SUM of their own
-    // DiscountAmount) whenever it's needed, same as any other per-item
-    // figure. totalAmount still has to subtract both, regardless of
-    // which one gets its own column.
+    // and each line's own Discount amount are two genuinely separate
+    // figures, matching how AdditionalCharges/RoundOff already stand
+    // alone rather than being folded into some other column.
+    // "Purchase"."DiscountAmount" stores ONLY extraDiscount — the header
+    // field's own value, nothing merged in — while the line-level total
+    // is never lost, it's just read back from the PurchaseItem rows
+    // themselves (SUM of their own DiscountAmount) whenever it's needed.
+    //
+    // Only extraDiscount is subtracted here: each line's subTotal is
+    // already net of its own discount, so subtracting the line total
+    // again would double-count it.
     const extraDiscount = Number(headerDiscount) || 0;
     const extraCharges = Number(additionalCharges) || 0;
     const roundOffAmount = Number(roundOff) || 0;
-    const totalDiscount = lineDiscountTotal + extraDiscount;
-    const totalAmount = subtotal - totalDiscount + taxAmountTotal + extraCharges + roundOffAmount;
+    const totalAmount = deriveTotalAmount({
+      lineTotalSum,
+      headerDiscount: extraDiscount,
+      additionalCharges: extraCharges,
+      roundOff: roundOffAmount,
+    });
+
+    const totalCheck = assertTotalMatchesLines({
+      totalAmount,
+      lineTotalSum,
+      headerDiscount: extraDiscount,
+      additionalCharges: extraCharges,
+      roundOff: roundOffAmount,
+    });
+    if (totalCheck?.error) {
+      await client.query("ROLLBACK");
+      console.error("createPurchase:", totalCheck.error);
+      return res.status(500).json({ success: false, message: "Purchase totals didn't balance — nothing was saved." });
+    }
 
     const paid = Math.max(Number(paidAmount) || 0, 0);
     const dueAmount = Math.max(totalAmount - paid, 0);
@@ -431,13 +473,30 @@ module.exports.updatePurchase = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, message: computed.error });
     }
-    const { preparedItems, subtotal, totalQty, lineDiscountTotal, taxAmountTotal } = computed;
+    const { preparedItems, subtotal, totalQty, taxAmountTotal, lineTotalSum } = computed;
 
     const extraDiscount = Number(headerDiscount) || 0;
     const extraCharges = Number(additionalCharges) || 0;
     const roundOffAmount = Number(roundOff) || 0;
-    const totalDiscount = lineDiscountTotal + extraDiscount;
-    const totalAmount = subtotal - totalDiscount + taxAmountTotal + extraCharges + roundOffAmount;
+    const totalAmount = deriveTotalAmount({
+      lineTotalSum,
+      headerDiscount: extraDiscount,
+      additionalCharges: extraCharges,
+      roundOff: roundOffAmount,
+    });
+
+    const totalCheck = assertTotalMatchesLines({
+      totalAmount,
+      lineTotalSum,
+      headerDiscount: extraDiscount,
+      additionalCharges: extraCharges,
+      roundOff: roundOffAmount,
+    });
+    if (totalCheck?.error) {
+      await client.query("ROLLBACK");
+      console.error("updatePurchase:", totalCheck.error);
+      return res.status(500).json({ success: false, message: "Purchase totals didn't balance — nothing was saved." });
+    }
 
     const paid = Math.max(Number(paidAmount) || 0, 0);
     const newDueAmount = Math.max(totalAmount - paid, 0);
