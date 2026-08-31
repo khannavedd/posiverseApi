@@ -15,10 +15,19 @@
 // the point of the whole design; without Kind there is no way to know
 // what a type the owner invented actually means.
 //
-// `formAvailable: false` means the app has no entry screen for this kind
-// yet. Those blueprints are NOT offered in the picker — letting someone
-// create a type that opens nothing is worse than not offering it. Flip
-// the flag when the screen exists; nothing else needs to change.
+// SIX KINDS, and that is the whole list (DEC-030). Sales invoice, sales
+// return, receive payment, purchase entry, purchase return, stock
+// update. Stock transfer was removed rather than left hidden — an
+// unreachable entry in a closed vocabulary is just clutter.
+//
+// ADDING A SEVENTH LATER is meant to be easy, and this is the recipe:
+//   1. add a blueprint here with its kind, label and defaults
+//   2. add the kind to the CHECK constraint (a migration)
+//   3. map it to an entry screen in the app's Utils/transactionKinds.js
+//   4. if it needs a form that doesn't exist, build that first
+// `formAvailable: false` keeps a kind out of the picker while step 4 is
+// outstanding — letting someone create a type that opens nothing is
+// worse than not offering it.
 //
 // These defaults are a STARTING POINT. The owner can rename the type and
 // change any flag afterwards. The API re-validates whatever they end up
@@ -67,10 +76,10 @@ const BLUEPRINTS = [
     formAvailable: true,
     defaults: {
       module: "sales",
-      // Direction is never read for this kind — updateStock is false and
-      // both engine consumers test that first. It needs *a* value only
-      // because the column is NOT NULL. See DEC-024.
-      direction: "adjustment",
+      // Never read for this kind — updateStock is false and both engine
+      // consumers test that first. It carries a value only because the
+      // column is NOT NULL, and the form hides the picker (DEC-030).
+      direction: "out",
       calculateTax: false,
       discountAllowed: false,
       paymentModeRequired: true,
@@ -120,37 +129,14 @@ const BLUEPRINTS = [
   {
     kind: "stock_update",
     label: "Stock update",
-    description: "Correct stock. Damage, theft, recount.",
+    description: "Count the shelf and set stock to what\u2019s there.",
     formAvailable: true,
     defaults: {
       module: "inventory",
-      // 'out' rather than 'adjustment' deliberately: the engine skips
-      // 'adjustment' entirely, so a stock update set to it would record
-      // a document and move no stock. Removing stock is the common
-      // manual correction; a business needing the other way creates a
-      // second type set to 'in'.
+      // Never read for this kind either. A stock update SETS stock to
+      // the counted quantity (DEC-029), and the engine keys that on
+      // Kind, not on Direction (DEC-030).
       direction: "out",
-      calculateTax: false,
-      discountAllowed: false,
-      paymentModeRequired: false,
-      customerMandatory: false,
-      vendorMandatory: false,
-      employeeMandatory: false,
-      salesImpact: false,
-      updateStock: true,
-    },
-  },
-  {
-    kind: "stock_transfer",
-    label: "Stock transfer",
-    description: "Move stock from one store to another.",
-    // No entry screen. A transfer needs a destination store, and a
-    // decision about whether it is one document or a paired out/in.
-    // Deliberately not offered until that is built.
-    formAvailable: false,
-    defaults: {
-      module: "inventory",
-      direction: "adjustment",
       calculateTax: false,
       discountAllowed: false,
       paymentModeRequired: false,

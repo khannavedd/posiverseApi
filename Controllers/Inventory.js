@@ -534,6 +534,25 @@ module.exports.updateInventory = async (req, res) => {
     }
     const existing = existingResult.rows[0];
 
+    // A stock update states an absolute count at a moment in time
+    // (DEC-029), so it cannot be meaningfully edited or cancelled:
+    // stock may have moved since, and "undoing" the count would restore
+    // a figure nobody can verify. Correct it by posting another count.
+    if (existing.TransactionTypeID) {
+      const typeCheck = await client.query(
+        `SELECT "Kind", "Name" FROM "TransactionType" WHERE "TransactionTypeID" = $1`,
+        [existing.TransactionTypeID]
+      );
+      if (typeCheck.rows[0]?.Kind === "stock_update") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          success: false,
+          message: `${typeCheck.rows[0].Name} documents can't be changed once posted — post another one with the correct count.`,
+        });
+      }
+    }
+
+
     // Same guard updateSale already has (Controllers/Sale.js) — without
     // this, editing an already-cancelled purchase would republish the
     // ORIGINAL (pre-cancel) item quantities/DueAmount as the new
@@ -698,6 +717,25 @@ module.exports.cancelInventory = async (req, res) => {
       return res.status(404).json({ success: false, message: "Purchase not found" });
     }
     const existing = existingResult.rows[0];
+
+    // A stock update states an absolute count at a moment in time
+    // (DEC-029), so it cannot be meaningfully edited or cancelled:
+    // stock may have moved since, and "undoing" the count would restore
+    // a figure nobody can verify. Correct it by posting another count.
+    if (existing.TransactionTypeID) {
+      const typeCheck = await client.query(
+        `SELECT "Kind", "Name" FROM "TransactionType" WHERE "TransactionTypeID" = $1`,
+        [existing.TransactionTypeID]
+      );
+      if (typeCheck.rows[0]?.Kind === "stock_update") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          success: false,
+          message: `${typeCheck.rows[0].Name} documents can't be changed once posted — post another one with the correct count.`,
+        });
+      }
+    }
+
 
     if (existing.Status === "cancelled") {
       await client.query("ROLLBACK");

@@ -216,9 +216,13 @@ module.exports.register = async (req, res) => {
       ]
     );
 
-    // Every new business starts with these three TransactionTypes —
-    // Sales Invoice, Purchase Entry and Stock Update — same
-    // per-RegistrationID shape
+    // Every new business starts with these five TransactionTypes.
+    // SALE_RETURN and PURCHASE_RETURN were missing here until migration
+    // 042 — Controllers/Sale.js's createSaleReturn looks SALE_RETURN up
+    // by Code, so returning items failed outright for any business
+    // created through signup rather than seeded by migration 012.
+    // Receive Payment is inserted separately below (different flags).
+    // Same per-RegistrationID shape
     // as migration 012's seed (Code is the stable internal key, Name is
     // the editable label). ON CONFLICT is just cheap insurance; this
     // RegistrationID is always brand new here, so it can never actually
@@ -233,10 +237,12 @@ module.exports.register = async (req, res) => {
         ("TransactionTypeID", "RegistrationID", "Module", "Kind", "Code", "Name", "Direction", "VendorMandatory")
        VALUES
         ($1, $2, 'sales', 'sale', 'SALE', 'Sales Invoice', 'out', false),
-        ($3, $2, 'inventory', 'purchase', 'PURCHASE', 'Purchase Entry', 'in', true),
-        ($4, $2, 'inventory', 'stock_update', 'STOCK_UPDATE', 'Stock Update', 'out', false)
+        ($3, $2, 'sales', 'sale_return', 'SALE_RETURN', 'Sales Return', 'in', false),
+        ($4, $2, 'inventory', 'purchase', 'PURCHASE', 'Purchase Entry', 'in', true),
+        ($5, $2, 'inventory', 'purchase_return', 'PURCHASE_RETURN', 'Purchase Return', 'out', true),
+        ($6, $2, 'inventory', 'stock_update', 'STOCK_UPDATE', 'Stock Update', 'out', false)
        ON CONFLICT ("RegistrationID", "Code") DO NOTHING`,
-      [crypto.randomUUID(), registrationId, crypto.randomUUID(), crypto.randomUUID()]
+      [crypto.randomUUID(), registrationId, crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()]
     );
 
     // "Receive Payment" — its own row, own explicit flags, since it
@@ -244,18 +250,17 @@ module.exports.register = async (req, res) => {
     // impact, no tax, not itself a sale). Existing businesses get this
     // same row via migration 032/033's backfill.
     //
-    // Direction is 'adjustment' only because the column is NOT NULL and
-    // the CHECK from migration 038 allows exactly three values. It is
+    // Direction is 'out' only because the column is NOT NULL. It is
     // never read for this type: UpdateStock is false, and both engine
     // consumers test UpdateStock before they look at Direction. The
-    // Module Configuration form hides the Direction picker when stock
-    // is off for the same reason.
+    // Module Configuration form hides the picker when stock is off for
+    // the same reason (DEC-030).
     await client.query(
       `INSERT INTO "TransactionType"
         ("TransactionTypeID", "RegistrationID", "Module", "Kind", "Code", "Name", "Direction",
          "CalculateTax", "CustomerMandatory", "DiscountAllowed", "PaymentModeRequired",
          "SalesImpact", "UpdateStock")
-       VALUES ($1, $2, 'sales', 'receive_payment', 'RECEIVE_PAYMENT', 'Receive Payment', 'adjustment',
+       VALUES ($1, $2, 'sales', 'receive_payment', 'RECEIVE_PAYMENT', 'Receive Payment', 'out',
          false, true, false, true, false, false)
        ON CONFLICT ("RegistrationID", "Code") DO NOTHING`,
       [crypto.randomUUID(), registrationId]

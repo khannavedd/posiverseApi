@@ -23,13 +23,15 @@ const BOOLEAN_FIELDS = [
 // so it belongs to the inventory module.
 const MODULES = ["sales", "inventory"];
 
-// Direction is only consulted for types that actually move stock —
-// posiverse-engine checks UpdateStock first. 'adjustment' means the
-// line quantity carries its own sign, as opposed to 'in' (always add)
-// and 'out' (always subtract). NOTE: the engine does not implement
-// 'adjustment' yet and skips those documents, so it is currently an
-// accurate label with no behaviour behind it. See migration 038.
-const DIRECTIONS = ["in", "out", "adjustment"];
+// Which way the quantity moves stock. Two values, and they mean exactly
+// what they say (DEC-030).
+//
+// Only consulted for delta-based kinds. A stock_update SETS stock —
+// that is keyed on Kind in posiverse-engine, not on a direction value —
+// and receive_payment never reaches Direction at all because
+// UpdateStock is false. Both carry a value only because the column is
+// NOT NULL, and the form hides the picker when stock isn't touched.
+const DIRECTIONS = ["in", "out"];
 
 // What sort of document a type represents. Drives which form the app
 // opens and which rules the API enforces — Module is too coarse, since
@@ -85,6 +87,44 @@ module.exports.createTransactionType = async (req, res) => {
       return acc;
     }, {});
 
+    // A deleted transaction type is only SOFT deleted (IsActive = false,
+    // see deleteTransactionType), but the unique constraint is on
+    // (RegistrationID, Code) and ignores IsActive — so a deleted type
+    // permanently reserves its code against a row the owner can no
+    // longer see. Creating it again returned "this code already exists"
+    // about something invisible, which is indistinguishable from a bug.
+    //
+    // Reactivating is safe: deleteTransactionType refuses to delete a
+    // type that any document or numbering series references, so a
+    // soft-deleted row provably has no history. Nothing is reinterpreted
+    // by giving it a new kind or new flags.
+    const revivable = await pool.query(
+      `SELECT "TransactionTypeID" FROM "TransactionType"
+       WHERE "RegistrationID" = $1 AND "Code" = $2 AND "IsActive" = false`,
+      [req.user.RegistrationID, code.trim().toUpperCase()]
+    );
+    if (revivable.rows.length > 0) {
+      const revived = await pool.query(
+        `UPDATE "TransactionType"
+         SET "Module" = $1, "Kind" = $2, "Name" = $3, "Direction" = $4,
+             "CalculateTax" = $5, "CustomerMandatory" = $6, "DiscountAllowed" = $7,
+             "DiscountPercentage" = $8, "EmployeeMandatory" = $9, "PaymentModeRequired" = $10,
+             "SalesImpact" = $11, "UpdateStock" = $12, "VendorMandatory" = $13,
+             "NumberingFormat" = $14, "IsActive" = true
+         WHERE "TransactionTypeID" = $15
+         RETURNING *`,
+        [
+          moduleName.trim(), kind, name.trim(), direction,
+          flags.calculateTax, flags.customerMandatory, flags.discountAllowed,
+          Number(discountPercentage) || 0, flags.employeeMandatory, flags.paymentModeRequired,
+          flags.salesImpact, flags.updateStock, flags.vendorMandatory,
+          JSON.stringify(Array.isArray(numberingFormat) ? numberingFormat : []),
+          revivable.rows[0].TransactionTypeID,
+        ]
+      );
+      return res.json({ success: true, transactionType: revived.rows[0] });
+    }
+
     const result = await pool.query(
       `INSERT INTO "TransactionType"
         ("TransactionTypeID", "RegistrationID", "Module", "Kind", "Code", "Name", "Direction",
@@ -117,7 +157,10 @@ module.exports.createTransactionType = async (req, res) => {
     return res.json({ success: true, transactionType: result.rows[0] });
   } catch (error) {
     if (error.code === "23505") {
-      return res.status(409).json({ success: false, message: "A transaction type with this code already exists" });
+      return res.status(409).json({
+        success: false,
+        message: "A transaction type with this code already exists. Codes have to be unique — pick a different one.",
+      });
     }
     console.error(error);
     return res.status(500).json({ success: false, message: "Error creating transaction type" });
@@ -220,15 +263,22 @@ module.exports.deleteTransactionType = async (req, res) => {
     const usageResult = await pool.query(
       `SELECT
          (SELECT COUNT(*)::int FROM "DocumentSeries" WHERE "TransactionTypeID" = $1) AS series_count,
-         (SELECT COUNT(*)::int FROM "Inventory" WHERE "TransactionTypeID" = $1) AS purchase_count`,
+         (SELECT COUNT(*)::int FROM "Inventory" WHERE "TransactionTypeID" = $1) AS purchase_count,
+         -- Sale was missing from this guard: a SALE or RECEIVE_PAYMENT
+         -- type could be deleted with real sales behind it, orphaning
+         -- their history from the type that describes them. Inventory
+         -- was checked, Sale never was.
+         (SELECT COUNT(*)::int FROM "Sale" WHERE "TransactionTypeID" = $1) AS sale_count`,
       [id]
     );
-    const { series_count: seriesCount, purchase_count: purchaseCount } = usageResult.rows[0];
+    const { series_count: seriesCount, purchase_count: purchaseCount, sale_count: saleCount } =
+      usageResult.rows[0];
 
-    if (purchaseCount > 0) {
+    const documentCount = purchaseCount + saleCount;
+    if (documentCount > 0) {
       return res.status(409).json({
         success: false,
-        message: `Can't delete — ${purchaseCount} purchase${purchaseCount === 1 ? "" : "s"} already use this transaction type.`,
+        message: `Can't delete — ${documentCount} document${documentCount === 1 ? "" : "s"} already use this transaction type.`,
       });
     }
     if (seriesCount > 0) {
