@@ -20,6 +20,7 @@ const pool = require("../DB/postgres");
 const { formatTransactionNumber } = require("../Utils/numberingFormat");
 const { publishInventoryEvent } = require("../Utils/publishEvent");
 const { publishAfterCommit } = require("../Utils/publishAfterCommit");
+const { resolveTransactionType, assertTypeRules } = require("../Utils/resolveTransactionType");
 
 // Shared by createInventory and updateInventory — looks up every Tax row
 // referenced by the line items in one go (so each item's tax split is
@@ -216,6 +217,7 @@ module.exports.createInventory = async (req, res) => {
     const {
       storeId,
       vendorId,
+      transactionTypeId,
       refNo,
       transactionDate,
       notes,
@@ -227,7 +229,10 @@ module.exports.createInventory = async (req, res) => {
     } = req.body;
 
     if (!storeId) return res.status(400).json({ success: false, message: "storeId is required" });
-    if (!vendorId) return res.status(400).json({ success: false, message: "vendorId is required" });
+    // vendorId is NOT required here any more — whether this document
+    // needs one is a property of its TransactionType (VendorMandatory,
+    // migration 041), checked by assertTypeRules once the type is
+    // resolved. A stock update has no vendor at all.
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: "At least one item is required" });
     }
@@ -255,25 +260,44 @@ module.exports.createInventory = async (req, res) => {
     }
     const store = storeCheck.rows[0];
 
-    const vendorCheck = await client.query(
-      `SELECT "VendorID" FROM "Vendor" WHERE "VendorID" = $1 AND "RegistrationID" = $2 AND "IsActive" = true`,
-      [vendorId, req.user.RegistrationID]
-    );
-    if (vendorCheck.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ success: false, message: "Vendor not found" });
+    // Still scoped to this business when supplied — a vendor is optional
+    // now, not unvalidated.
+    if (vendorId) {
+      const vendorCheck = await client.query(
+        `SELECT "VendorID" FROM "Vendor" WHERE "VendorID" = $1 AND "RegistrationID" = $2 AND "IsActive" = true`,
+        [vendorId, req.user.RegistrationID]
+      );
+      if (vendorCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, message: "Vendor not found" });
+      }
     }
 
-    const txnTypeResult = await client.query(
-      `SELECT * FROM "TransactionType"
-       WHERE "RegistrationID" = $1 AND "Code" = 'PURCHASE' AND "IsActive" = true`,
-      [req.user.RegistrationID]
-    );
-    if (txnTypeResult.rows.length === 0) {
+    // The client names which kind of document this is. resolveTransactionType
+    // proves the type is this business's, active, and an inventory type —
+    // see its header for why each of those matters. Omitting
+    // transactionTypeId falls back to PURCHASE, so an app build older
+    // than DEC-027 keeps working unchanged.
+    const resolved = await resolveTransactionType(client, {
+      registrationId: req.user.RegistrationID,
+      transactionTypeId,
+      fallbackCode: "PURCHASE",
+      module: "inventory",
+    });
+    if (resolved.error) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ success: false, message: "Purchase Entry transaction type isn't set up for this business" });
+      return res.status(resolved.status).json({ success: false, message: resolved.error });
     }
-    const transactionType = txnTypeResult.rows[0];
+    const { transactionType } = resolved;
+
+    // The type's own rules, enforced here and not only in the app. The
+    // form hides the vendor picker for a stock update; that's a
+    // convenience, this is the guarantee.
+    const ruleError = assertTypeRules(transactionType, { vendorId });
+    if (ruleError) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: ruleError.error });
+    }
 
     // Purchase itself has no CashRegisterID (purchases aren't processed
     // at a till), but the numbering format can still reference a Cash
@@ -732,7 +756,10 @@ module.exports.listInventory = async (req, res) => {
     const result = await pool.query(
       `SELECT p.*, v."Name" AS "VendorName"
        FROM "Inventory" p
-       JOIN "Vendor" v ON v."VendorID" = p."VendorID"
+       -- LEFT, not INNER: migration 041 made VendorID nullable so a
+       -- stock update can exist. An inner join here would silently
+       -- drop every vendorless document from the list.
+       LEFT JOIN "Vendor" v ON v."VendorID" = p."VendorID"
        JOIN "Store" s ON s."StoreID" = p."StoreID"
        WHERE s."RegistrationID" = $1 ${storeFilter}
        ORDER BY p."TransactionDate" DESC`,
@@ -753,7 +780,10 @@ module.exports.getInventory = async (req, res) => {
     const inventoryResult = await pool.query(
       `SELECT p.*, v."Name" AS "VendorName"
        FROM "Inventory" p
-       JOIN "Vendor" v ON v."VendorID" = p."VendorID"
+       -- LEFT, not INNER: migration 041 made VendorID nullable so a
+       -- stock update can exist. An inner join here would silently
+       -- drop every vendorless document from the list.
+       LEFT JOIN "Vendor" v ON v."VendorID" = p."VendorID"
        JOIN "Store" s ON s."StoreID" = p."StoreID"
        WHERE p."InventoryID" = $1 AND s."RegistrationID" = $2`,
       [id, req.user.RegistrationID]

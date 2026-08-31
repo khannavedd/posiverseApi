@@ -3,6 +3,7 @@ const pool = require("../DB/postgres");
 const { formatTransactionNumber } = require("../Utils/numberingFormat");
 const { publishSaleEvent } = require("../Utils/publishEvent");
 const { publishAfterCommit } = require("../Utils/publishAfterCommit");
+const { resolveTransactionType, assertTypeRules } = require("../Utils/resolveTransactionType");
 
 // Same shape/purpose as Controllers/Inventory.js's computeItems — looks
 // up every Tax row referenced by the line items in one go, validates
@@ -365,6 +366,7 @@ module.exports.createSale = async (req, res) => {
     const {
       storeId,
       customerId,
+      transactionTypeId,
       refNo,
       transactionDate,
       notes,
@@ -421,16 +423,28 @@ module.exports.createSale = async (req, res) => {
       }
     }
 
-    const txnTypeResult = await client.query(
-      `SELECT * FROM "TransactionType"
-       WHERE "RegistrationID" = $1 AND "Code" = 'SALE' AND "IsActive" = true`,
-      [req.user.RegistrationID]
-    );
-    if (txnTypeResult.rows.length === 0) {
+    // See Controllers/Inventory.js's createInventory and
+    // Utils/resolveTransactionType.js — the client names the type, the
+    // server proves it is this business's, active, and a sales type.
+    // Omitting transactionTypeId falls back to SALE, so an older app
+    // build keeps working.
+    const resolved = await resolveTransactionType(client, {
+      registrationId: req.user.RegistrationID,
+      transactionTypeId,
+      fallbackCode: "SALE",
+      module: "sales",
+    });
+    if (resolved.error) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ success: false, message: "Sales Invoice transaction type isn't set up for this business" });
+      return res.status(resolved.status).json({ success: false, message: resolved.error });
     }
-    const transactionType = txnTypeResult.rows[0];
+    const { transactionType } = resolved;
+
+    const ruleError = assertTypeRules(transactionType, { customerId });
+    if (ruleError) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, message: ruleError.error });
+    }
 
     const cashRegisterResult = await client.query(
       `SELECT "Code" FROM "CashRegister" WHERE "StoreID" = $1 AND "IsActive" = true ORDER BY "CreatedAt" ASC LIMIT 1`,

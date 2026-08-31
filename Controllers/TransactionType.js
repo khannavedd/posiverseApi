@@ -9,6 +9,9 @@ const BOOLEAN_FIELDS = [
   "paymentModeRequired",
   "salesImpact",
   "updateStock",
+  // Added by migration 041 — mirrors customerMandatory for the
+  // inventory side. A stock update needs no vendor.
+  "vendorMandatory",
 ];
 
 // Closed vocabularies, matching the CHECK constraints migration 038 put
@@ -28,6 +31,19 @@ const MODULES = ["sales", "inventory"];
 // accurate label with no behaviour behind it. See migration 038.
 const DIRECTIONS = ["in", "out", "adjustment"];
 
+// What sort of document a type represents. Drives which form the app
+// opens and which rules the API enforces — Module is too coarse, since
+// Purchase Entry and Stock Update are both 'inventory'. See
+// Utils/transactionTypeBlueprints.js and migration 041 (DEC-027).
+const { KINDS, byKind, availableBlueprints } = require("../Utils/transactionTypeBlueprints");
+
+// The catalogue the app's "add transaction type" picker renders. Served
+// rather than duplicated in the app so there is one definition of what
+// each kind means and which ones have a working form.
+module.exports.getBlueprints = async (req, res) => {
+  return res.json({ success: true, blueprints: availableBlueprints() });
+};
+
 module.exports.getTransactionTypes = async (req, res) => {
   try {
     const result = await pool.query(
@@ -43,34 +59,45 @@ module.exports.getTransactionTypes = async (req, res) => {
 
 module.exports.createTransactionType = async (req, res) => {
   try {
-    const { module: moduleName, code, name, direction, discountPercentage, numberingFormat } = req.body;
-    if (!moduleName || !code || !name || !direction) {
-      return res.status(400).json({ success: false, message: "module, code, name, and direction are required" });
+    const { kind, code, name, discountPercentage, numberingFormat } = req.body;
+    if (!kind || !code || !name) {
+      return res.status(400).json({ success: false, message: "kind, code, and name are required" });
     }
-    if (!MODULES.includes(moduleName)) {
-      return res.status(400).json({ success: false, message: `module must be one of: ${MODULES.join(", ")}` });
-    }
-    if (!DIRECTIONS.includes(direction)) {
-      return res.status(400).json({ success: false, message: `direction must be one of: ${DIRECTIONS.join(", ")}` });
+    if (!KINDS.includes(kind)) {
+      return res.status(400).json({ success: false, message: `kind must be one of: ${KINDS.join(", ")}` });
     }
 
+    // Module comes from the blueprint, NOT from the client. It is a
+    // property of the kind, and accepting it separately would allow a
+    // 'sale' kind filed under the inventory module — which
+    // resolveTransactionType would then accept on /inventory.
+    const blueprint = byKind[kind];
+    const moduleName = blueprint.defaults.module;
+    const direction = DIRECTIONS.includes(req.body.direction)
+      ? req.body.direction
+      : blueprint.defaults.direction;
+
+    // Flags fall back to the blueprint's, not to `true`. The previous
+    // code defaulted every unspecified flag ON, which is wrong for kinds
+    // like stock_update where most should be off.
     const flags = BOOLEAN_FIELDS.reduce((acc, field) => {
-      acc[field] = req.body[field] != null ? !!req.body[field] : true;
+      acc[field] = req.body[field] != null ? !!req.body[field] : !!blueprint.defaults[field];
       return acc;
     }, {});
 
     const result = await pool.query(
       `INSERT INTO "TransactionType"
-        ("TransactionTypeID", "RegistrationID", "Module", "Code", "Name", "Direction",
+        ("TransactionTypeID", "RegistrationID", "Module", "Kind", "Code", "Name", "Direction",
          "CalculateTax", "CustomerMandatory", "DiscountAllowed", "DiscountPercentage",
          "EmployeeMandatory", "PaymentModeRequired", "SalesImpact", "UpdateStock",
-         "NumberingFormat", "IsActive")
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, true)
+         "VendorMandatory", "NumberingFormat", "IsActive")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, true)
        RETURNING *`,
       [
         crypto.randomUUID(),
         req.user.RegistrationID,
         moduleName.trim(),
+        kind,
         code.trim().toUpperCase(),
         name.trim(),
         direction,
@@ -82,6 +109,7 @@ module.exports.createTransactionType = async (req, res) => {
         flags.paymentModeRequired,
         flags.salesImpact,
         flags.updateStock,
+        flags.vendorMandatory,
         JSON.stringify(Array.isArray(numberingFormat) ? numberingFormat : []),
       ]
     );
@@ -99,19 +127,42 @@ module.exports.createTransactionType = async (req, res) => {
 module.exports.updateTransactionType = async (req, res) => {
   try {
     const { id } = req.params;
-    const { module: moduleName, code, name, direction, discountPercentage, numberingFormat } = req.body;
-    if (!moduleName || !code || !name || !direction) {
-      return res.status(400).json({ success: false, message: "module, code, name, and direction are required" });
+    const { name, direction, discountPercentage, numberingFormat } = req.body;
+    if (!name) {
+      return res.status(400).json({ success: false, message: "name is required" });
     }
-    if (!MODULES.includes(moduleName)) {
-      return res.status(400).json({ success: false, message: `module must be one of: ${MODULES.join(", ")}` });
-    }
-    if (!DIRECTIONS.includes(direction)) {
+    if (direction && !DIRECTIONS.includes(direction)) {
       return res.status(400).json({ success: false, message: `direction must be one of: ${DIRECTIONS.join(", ")}` });
     }
 
+    // Kind, Module and Code are all IMMUTABLE after creation, and are
+    // deliberately not read from the body here:
+    //
+    //   Kind/Module — changing them would silently reinterpret every
+    //   document already filed under this type. A purchase history would
+    //   become a stock-adjustment history.
+    //
+    //   Code — it is the stable internal key. Controllers/Sale.js looks
+    //   up 'RECEIVE_PAYMENT' and 'SALE_RETURN' by Code, and
+    //   resolveTransactionType falls back to 'SALE'/'PURCHASE' by Code
+    //   when the client names no type. Letting the owner edit it would
+    //   break those lookups with no warning. Name is the editable label —
+    //   that was migration 012's stated intent and it was not enforced.
+    const existing = await pool.query(
+      `SELECT * FROM "TransactionType" WHERE "TransactionTypeID" = $1 AND "RegistrationID" = $2`,
+      [req.params.id, req.user.RegistrationID]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Transaction type not found" });
+    }
+    const current = existing.rows[0];
+    const moduleName = current.Module;
+    const code = current.Code;
+    const effectiveDirection = direction || current.Direction;
+
     const flags = BOOLEAN_FIELDS.reduce((acc, field) => {
-      acc[field] = req.body[field] != null ? !!req.body[field] : true;
+      const dbField = field.charAt(0).toUpperCase() + field.slice(1);
+      acc[field] = req.body[field] != null ? !!req.body[field] : !!current[dbField];
       return acc;
     }, {});
 
@@ -120,14 +171,14 @@ module.exports.updateTransactionType = async (req, res) => {
        SET "Module" = $1, "Code" = $2, "Name" = $3, "Direction" = $4,
            "CalculateTax" = $5, "CustomerMandatory" = $6, "DiscountAllowed" = $7, "DiscountPercentage" = $8,
            "EmployeeMandatory" = $9, "PaymentModeRequired" = $10, "SalesImpact" = $11, "UpdateStock" = $12,
-           "NumberingFormat" = $13
-       WHERE "TransactionTypeID" = $14 AND "RegistrationID" = $15
+           "VendorMandatory" = $13, "NumberingFormat" = $14
+       WHERE "TransactionTypeID" = $15 AND "RegistrationID" = $16
        RETURNING *`,
       [
         moduleName.trim(),
         code.trim().toUpperCase(),
         name.trim(),
-        direction,
+        effectiveDirection,
         flags.calculateTax,
         flags.customerMandatory,
         flags.discountAllowed,
@@ -136,6 +187,7 @@ module.exports.updateTransactionType = async (req, res) => {
         flags.paymentModeRequired,
         flags.salesImpact,
         flags.updateStock,
+        flags.vendorMandatory,
         JSON.stringify(Array.isArray(numberingFormat) ? numberingFormat : []),
         id,
         req.user.RegistrationID,
