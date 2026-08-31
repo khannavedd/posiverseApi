@@ -754,12 +754,19 @@ module.exports.listInventory = async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT p.*, v."Name" AS "VendorName"
+      `SELECT p.*, v."Name" AS "VendorName",
+              tt."Name" AS "TransactionTypeName", tt."Kind" AS "TransactionTypeKind",
+              tt."VendorMandatory", tt."CalculateTax", tt."DiscountAllowed", tt."PaymentModeRequired"
        FROM "Inventory" p
        -- LEFT, not INNER: migration 041 made VendorID nullable so a
        -- stock update can exist. An inner join here would silently
        -- drop every vendorless document from the list.
        LEFT JOIN "Vendor" v ON v."VendorID" = p."VendorID"
+       -- The type's flags travel with the document so the edit screen
+       -- can rebuild the same form it was created with. Without this,
+       -- editing a stock update falls back to "vendor required" and
+       -- refuses to save a document that never had one.
+       LEFT JOIN "TransactionType" tt ON tt."TransactionTypeID" = p."TransactionTypeID"
        JOIN "Store" s ON s."StoreID" = p."StoreID"
        WHERE s."RegistrationID" = $1 ${storeFilter}
        ORDER BY p."TransactionDate" DESC`,
@@ -778,12 +785,19 @@ module.exports.getInventory = async (req, res) => {
     const { id } = req.params;
 
     const inventoryResult = await pool.query(
-      `SELECT p.*, v."Name" AS "VendorName"
+      `SELECT p.*, v."Name" AS "VendorName",
+              tt."Name" AS "TransactionTypeName", tt."Kind" AS "TransactionTypeKind",
+              tt."VendorMandatory", tt."CalculateTax", tt."DiscountAllowed", tt."PaymentModeRequired"
        FROM "Inventory" p
        -- LEFT, not INNER: migration 041 made VendorID nullable so a
        -- stock update can exist. An inner join here would silently
        -- drop every vendorless document from the list.
        LEFT JOIN "Vendor" v ON v."VendorID" = p."VendorID"
+       -- The type's flags travel with the document so the edit screen
+       -- can rebuild the same form it was created with. Without this,
+       -- editing a stock update falls back to "vendor required" and
+       -- refuses to save a document that never had one.
+       LEFT JOIN "TransactionType" tt ON tt."TransactionTypeID" = p."TransactionTypeID"
        JOIN "Store" s ON s."StoreID" = p."StoreID"
        WHERE p."InventoryID" = $1 AND s."RegistrationID" = $2`,
       [id, req.user.RegistrationID]

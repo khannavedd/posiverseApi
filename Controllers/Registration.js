@@ -216,8 +216,9 @@ module.exports.register = async (req, res) => {
       ]
     );
 
-    // Every new business starts with these two TransactionTypes —
-    // Sales Invoice and Purchase Entry — same per-RegistrationID shape
+    // Every new business starts with these three TransactionTypes —
+    // Sales Invoice, Purchase Entry and Stock Update — same
+    // per-RegistrationID shape
     // as migration 012's seed (Code is the stable internal key, Name is
     // the editable label). ON CONFLICT is just cheap insurance; this
     // RegistrationID is always brand new here, so it can never actually
@@ -229,12 +230,13 @@ module.exports.register = async (req, res) => {
     // CHECK constraint enforces it.
     await client.query(
       `INSERT INTO "TransactionType"
-        ("TransactionTypeID", "RegistrationID", "Module", "Code", "Name", "Direction")
+        ("TransactionTypeID", "RegistrationID", "Module", "Kind", "Code", "Name", "Direction", "VendorMandatory")
        VALUES
-        ($1, $2, 'sales', 'SALE', 'Sales Invoice', 'out'),
-        ($3, $2, 'inventory', 'PURCHASE', 'Purchase Entry', 'in')
+        ($1, $2, 'sales', 'sale', 'SALE', 'Sales Invoice', 'out', false),
+        ($3, $2, 'inventory', 'purchase', 'PURCHASE', 'Purchase Entry', 'in', true),
+        ($4, $2, 'inventory', 'stock_update', 'STOCK_UPDATE', 'Stock Update', 'out', false)
        ON CONFLICT ("RegistrationID", "Code") DO NOTHING`,
-      [crypto.randomUUID(), registrationId, crypto.randomUUID()]
+      [crypto.randomUUID(), registrationId, crypto.randomUUID(), crypto.randomUUID()]
     );
 
     // "Receive Payment" — its own row, own explicit flags, since it
@@ -250,10 +252,10 @@ module.exports.register = async (req, res) => {
     // is off for the same reason.
     await client.query(
       `INSERT INTO "TransactionType"
-        ("TransactionTypeID", "RegistrationID", "Module", "Code", "Name", "Direction",
+        ("TransactionTypeID", "RegistrationID", "Module", "Kind", "Code", "Name", "Direction",
          "CalculateTax", "CustomerMandatory", "DiscountAllowed", "PaymentModeRequired",
          "SalesImpact", "UpdateStock")
-       VALUES ($1, $2, 'sales', 'RECEIVE_PAYMENT', 'Receive Payment', 'adjustment',
+       VALUES ($1, $2, 'sales', 'receive_payment', 'RECEIVE_PAYMENT', 'Receive Payment', 'adjustment',
          false, true, false, true, false, false)
        ON CONFLICT ("RegistrationID", "Code") DO NOTHING`,
       [crypto.randomUUID(), registrationId]
