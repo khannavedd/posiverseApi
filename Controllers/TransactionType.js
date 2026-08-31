@@ -11,6 +11,23 @@ const BOOLEAN_FIELDS = [
   "updateStock",
 ];
 
+// Closed vocabularies, matching the CHECK constraints migration 038 put
+// on the columns (DEC-024). Validated here as well as in the database so
+// the client gets a readable message instead of a raw 23514 constraint
+// violation — the DB constraint is the guarantee, this is the manners.
+//
+// 'purchase' is deliberately absent: a purchase is how stock arrives,
+// so it belongs to the inventory module.
+const MODULES = ["sales", "inventory"];
+
+// Direction is only consulted for types that actually move stock —
+// posiverse-engine checks UpdateStock first. 'adjustment' means the
+// line quantity carries its own sign, as opposed to 'in' (always add)
+// and 'out' (always subtract). NOTE: the engine does not implement
+// 'adjustment' yet and skips those documents, so it is currently an
+// accurate label with no behaviour behind it. See migration 038.
+const DIRECTIONS = ["in", "out", "adjustment"];
+
 module.exports.getTransactionTypes = async (req, res) => {
   try {
     const result = await pool.query(
@@ -29,6 +46,12 @@ module.exports.createTransactionType = async (req, res) => {
     const { module: moduleName, code, name, direction, discountPercentage, numberingFormat } = req.body;
     if (!moduleName || !code || !name || !direction) {
       return res.status(400).json({ success: false, message: "module, code, name, and direction are required" });
+    }
+    if (!MODULES.includes(moduleName)) {
+      return res.status(400).json({ success: false, message: `module must be one of: ${MODULES.join(", ")}` });
+    }
+    if (!DIRECTIONS.includes(direction)) {
+      return res.status(400).json({ success: false, message: `direction must be one of: ${DIRECTIONS.join(", ")}` });
     }
 
     const flags = BOOLEAN_FIELDS.reduce((acc, field) => {
@@ -79,6 +102,12 @@ module.exports.updateTransactionType = async (req, res) => {
     const { module: moduleName, code, name, direction, discountPercentage, numberingFormat } = req.body;
     if (!moduleName || !code || !name || !direction) {
       return res.status(400).json({ success: false, message: "module, code, name, and direction are required" });
+    }
+    if (!MODULES.includes(moduleName)) {
+      return res.status(400).json({ success: false, message: `module must be one of: ${MODULES.join(", ")}` });
+    }
+    if (!DIRECTIONS.includes(direction)) {
+      return res.status(400).json({ success: false, message: `direction must be one of: ${DIRECTIONS.join(", ")}` });
     }
 
     const flags = BOOLEAN_FIELDS.reduce((acc, field) => {
@@ -139,7 +168,7 @@ module.exports.deleteTransactionType = async (req, res) => {
     const usageResult = await pool.query(
       `SELECT
          (SELECT COUNT(*)::int FROM "DocumentSeries" WHERE "TransactionTypeID" = $1) AS series_count,
-         (SELECT COUNT(*)::int FROM "Purchase" WHERE "TransactionTypeID" = $1) AS purchase_count`,
+         (SELECT COUNT(*)::int FROM "Inventory" WHERE "TransactionTypeID" = $1) AS purchase_count`,
       [id]
     );
     const { series_count: seriesCount, purchase_count: purchaseCount } = usageResult.rows[0];

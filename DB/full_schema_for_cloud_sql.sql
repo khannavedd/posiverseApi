@@ -1,10 +1,37 @@
+-- ############################################################
+-- ## STALE — DO NOT USE THIS ALONE TO BOOTSTRAP A DATABASE. ##
+-- ############################################################
+--
+-- This file was reconstructed by walking migrations 001-021. Everything
+-- from migration 022 onward is MISSING, including entire tables the app
+-- cannot run without:
+--
+--   Customer, Sale, SaleItem, SalePayment, PaymentType, PrintTemplate
+--
+-- (plus Sale/Purchase idempotency keys, Sale.ReturnOfSaleID,
+-- Product.TaxInclusive, the SKU/barcode unique indexes, and the
+-- TransactionType Module/Direction CHECK constraints from 038.)
+--
+-- A database created from this file alone will fail the moment anyone
+-- opens the POS, a customer screen, or Setup. To set up a fresh
+-- database, run DB/migrations/001 through 039 in order instead.
+--
+-- The table names below have been kept in step with migration 039
+-- (Purchase -> Inventory) so this file isn't ALSO wrong about naming,
+-- but that does not make it usable. Either regenerate it from the full
+-- migration history or delete it.
+--
+-- ------------------------------------------------------------
+--
+-- Original header follows.
+--
 -- One-time, schema-only setup for a fresh Cloud SQL database — paste
 -- this whole file into Cloud SQL Studio's query editor (or a Cloud
 -- Shell psql session) and run it once. No data, no seed inserts —
 -- Registration/User/Store/ACL/TransactionType/CashRegister all get
 -- created automatically the moment you register a new business through
 -- the app (see Controllers/Registration.js); everything else
--- (Category/Brand/Tax/Product/Vendor/Purchase) gets added through the
+-- (Category/Brand/Tax/Product/Vendor/Inventory) gets added through the
 -- app's own screens as you use it.
 --
 -- This is the CURRENT final shape of every table — reconstructed by
@@ -25,7 +52,7 @@
 --   Category, Brand, Tax, Product,
 --   CashRegister, TransactionType, DocumentSeries,
 --   InStock,
---   Vendor, Purchase, PurchaseItem
+--   Vendor, Inventory, InventoryItem
 
 BEGIN;
 
@@ -238,7 +265,7 @@ CREATE TABLE IF NOT EXISTS "InStock" (
 
 CREATE INDEX IF NOT EXISTS idx_instock_store_product ON "InStock"("StoreID", "ProductID");
 
--- Vendor / Purchase
+-- Vendor / Inventory documents
 
 CREATE TABLE IF NOT EXISTS "Vendor" (
   "VendorID" uuid PRIMARY KEY,
@@ -254,8 +281,8 @@ CREATE TABLE IF NOT EXISTS "Vendor" (
   "UpdatedAt" timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS "Purchase" (
-  "PurchaseID" uuid PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS "Inventory" (
+  "InventoryID" uuid PRIMARY KEY,
   "StoreID" uuid NOT NULL,
   "VendorID" uuid NOT NULL REFERENCES "Vendor"("VendorID"),
   "TransactionTypeID" uuid REFERENCES "TransactionType"("TransactionTypeID"),
@@ -281,9 +308,9 @@ CREATE TABLE IF NOT EXISTS "Purchase" (
   "UpdatedAt" timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS "PurchaseItem" (
-  "PurchaseItemID" uuid PRIMARY KEY,
-  "PurchaseID" uuid NOT NULL REFERENCES "Purchase"("PurchaseID"),
+CREATE TABLE IF NOT EXISTS "InventoryItem" (
+  "InventoryItemID" uuid PRIMARY KEY,
+  "InventoryID" uuid NOT NULL REFERENCES "Inventory"("InventoryID"),
   "ProductID" uuid NOT NULL REFERENCES "Product"("ProductID"),
   "Qty" numeric(12,2) NOT NULL,
   "UnitCost" numeric(12,2) NOT NULL,
@@ -299,10 +326,10 @@ CREATE TABLE IF NOT EXISTS "PurchaseItem" (
   "Notes" varchar(255)
 );
 
-CREATE INDEX IF NOT EXISTS idx_purchase_store ON "Purchase"("StoreID");
-CREATE INDEX IF NOT EXISTS idx_purchase_vendor ON "Purchase"("VendorID");
-CREATE INDEX IF NOT EXISTS idx_purchaseitem_purchase ON "PurchaseItem"("PurchaseID");
-CREATE INDEX IF NOT EXISTS idx_purchaseitem_product ON "PurchaseItem"("ProductID");
+CREATE INDEX IF NOT EXISTS idx_inventory_store ON "Inventory"("StoreID");
+CREATE INDEX IF NOT EXISTS idx_inventory_vendor ON "Inventory"("VendorID");
+CREATE INDEX IF NOT EXISTS idx_inventoryitem_inventory ON "InventoryItem"("InventoryID");
+CREATE INDEX IF NOT EXISTS idx_inventoryitem_product ON "InventoryItem"("ProductID");
 
 -- (migration 015 added a transactional outbox here; migration 018
 -- dropped it — Purchase create/update now publish straight to Pub/Sub,

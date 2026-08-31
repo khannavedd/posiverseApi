@@ -90,7 +90,7 @@ module.exports.deleteVendor = async (req, res) => {
     const { id } = req.params;
 
     const purchaseResult = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM "Purchase"
+      `SELECT COUNT(*)::int AS count FROM "Inventory"
        WHERE "VendorID" = $1 AND "StoreID" IN (SELECT "StoreID" FROM "Store" WHERE "RegistrationID" = $2)`,
       [id, req.user.RegistrationID]
     );

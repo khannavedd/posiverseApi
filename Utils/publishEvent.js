@@ -14,7 +14,7 @@ const pubsub = require("./pubsub");
 // outbox pattern that lived in Controllers/Outbox.js): if the process
 // crashes or Pub/Sub is unreachable in the moment between COMMIT and
 // this call resolving, that event is lost — nothing retries it later.
-// Callers await this before responding (see Controllers/Purchase.js)
+// Callers await this before responding (see Controllers/Inventory.js)
 // specifically so Cloud Run keeps the instance's CPU active until the
 // publish finishes; a fire-and-forget call after res.json() is not
 // safe on Cloud Run; the instance can freeze immediately after the
@@ -46,42 +46,47 @@ async function publishEvent({ aggregateType, eventType, beforeData, afterData, i
   }
 }
 
-function purchaseSnapshot(purchase) {
+function inventorySnapshot(doc) {
   return {
-    PurchaseID: purchase.PurchaseID,
-    StoreID: purchase.StoreID,
-    VendorID: purchase.VendorID,
-    TransactionTypeID: purchase.TransactionTypeID,
-    TransactionNo: purchase.TransactionNo,
-    TransactionDate: purchase.TransactionDate,
-    DueAmount: purchase.DueAmount,
+    InventoryID: doc.InventoryID,
+    StoreID: doc.StoreID,
+    VendorID: doc.VendorID,
+    TransactionTypeID: doc.TransactionTypeID,
+    TransactionNo: doc.TransactionNo,
+    TransactionDate: doc.TransactionDate,
+    DueAmount: doc.DueAmount,
   };
 }
 
-// Publishes a Purchase create/update as a single event — afterData
-// carries the whole purchase header plus every line item, and
-// InventoryID is the Purchase's own ID. Consumers (posiverse-engine)
+// Publishes an inventory document create/update as a single event —
+// afterData carries the whole header plus every line item, and
+// inventoryId is the document's own ID. Consumers (posiverse-engine)
 // loop over afterData.items themselves to apply each line's InStock
-// adjustment, the same way the reference
-// onCreateInventoryUpdateInStockQty.js loops over inventory.LineItems,
-// and diff beforeData vs. afterData for anything that needs the delta
-// (e.g. Vendor.DueAmount) instead of Controllers/Purchase.js computing
-// and applying that itself.
+// adjustment, and diff beforeData vs. afterData for anything that needs
+// the delta (e.g. Vendor.DueAmount) rather than the controller
+// computing and applying that itself.
 //
-// beforePurchase/beforeItems are omitted for a create (nothing existed
-// before) and required for an update — see Controllers/Purchase.js's
-// updatePurchase, which fetches the pre-edit purchase + items before
+// beforeDoc/beforeItems are omitted for a create (nothing existed
+// before) and required for an update — see Controllers/Inventory.js's
+// updateInventory, which fetches the pre-edit document + items before
 // overwriting them specifically so this function has something to put
 // in beforeData.
-async function publishPurchaseEvent({ eventType, purchase, items, beforePurchase, beforeItems }) {
+//
+// WIRE FORMAT CHANGED (DEC-026): the payload key is now `inventory`
+// (was `purchase`) and eventType is InventoryCreated/InventoryUpdated
+// (was PurchaseCreated/PurchaseUpdated), following the table rename.
+// posiverse-engine accepts BOTH spellings, so the two services can be
+// deployed in either order without a message in flight being dropped.
+// Deploy the engine first regardless — it is the tolerant side.
+async function publishInventoryEvent({ eventType, doc, items, beforeDoc, beforeItems }) {
   await publishEvent({
     aggregateType: "Inventory",
     eventType,
-    beforeData: beforePurchase
-      ? { purchase: purchaseSnapshot(beforePurchase), items: beforeItems || [] }
+    beforeData: beforeDoc
+      ? { inventory: inventorySnapshot(beforeDoc), items: beforeItems || [] }
       : null,
-    afterData: { purchase: purchaseSnapshot(purchase), items },
-    inventoryId: purchase.PurchaseID,
+    afterData: { inventory: inventorySnapshot(doc), items },
+    inventoryId: doc.InventoryID,
   });
 }
 
@@ -111,7 +116,7 @@ function saleSnapshot(sale) {
   };
 }
 
-// Same shape/pattern as publishPurchaseEvent, published to the separate
+// Same shape/pattern as publishInventoryEvent, published to the separate
 // "Sales" topic instead — see TOPIC_BY_AGGREGATE above.
 async function publishSaleEvent({ eventType, sale, items, beforeSale, beforeItems }) {
   await publishEvent({
@@ -125,4 +130,4 @@ async function publishSaleEvent({ eventType, sale, items, beforeSale, beforeItem
   });
 }
 
-module.exports = { publishEvent, publishPurchaseEvent, publishSaleEvent };
+module.exports = { publishEvent, publishInventoryEvent, publishSaleEvent };

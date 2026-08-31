@@ -25,10 +25,10 @@ const DEFAULT_PLAN_ID = 1;
 // itself states exactly what this user can do rather than relying only
 // on the role name.
 //
-// No sales.delete / purchase.delete — once posted, a sale or purchase
-// carries a sequential invoice number from DocumentSeries; deleting it
-// would leave a gap in that sequence. Undo one with sales.return /
-// purchase.return instead.
+// No sales.delete / inventory.delete — once posted, a sale or an
+// inventory document carries a sequential number from DocumentSeries;
+// deleting it would leave a gap in that sequence. Undo one with
+// sales.return / inventory.return instead.
 const OWNER_PERMISSIONS = [
   "dashboard.view",
 
@@ -37,7 +37,15 @@ const OWNER_PERMISSIONS = [
   "catalog.edit",
   "catalog.delete",
 
+  // One family for everything in the inventory module — migration 040
+  // folded the old purchase.view/create/edit/return into these
+  // (DEC-026). Purchase Entry is one kind of inventory document, not a
+  // separate area with its own permissions; stock adjustments and
+  // transfers use the same four.
   "inventory.view",
+  "inventory.create",
+  "inventory.edit",
+  "inventory.return",
   "inventory.adjust",
   "inventory.transfer",
 
@@ -46,11 +54,6 @@ const OWNER_PERMISSIONS = [
   "sales.edit",
   "sales.return",
   "sales.payment",
-
-  "purchase.view",
-  "purchase.create",
-  "purchase.edit",
-  "purchase.return",
 
   "customer.view",
   "customer.create",
@@ -219,12 +222,17 @@ module.exports.register = async (req, res) => {
     // the editable label). ON CONFLICT is just cheap insurance; this
     // RegistrationID is always brand new here, so it can never actually
     // fire.
+    //
+    // Purchase Entry's Module is 'inventory', not 'purchase' — see
+    // migration 038 (DEC-024). A purchase is how stock arrives, so it
+    // lives under Inventory; there are only two modules now, and a
+    // CHECK constraint enforces it.
     await client.query(
       `INSERT INTO "TransactionType"
         ("TransactionTypeID", "RegistrationID", "Module", "Code", "Name", "Direction")
        VALUES
         ($1, $2, 'sales', 'SALE', 'Sales Invoice', 'out'),
-        ($3, $2, 'purchase', 'PURCHASE', 'Purchase Entry', 'in')
+        ($3, $2, 'inventory', 'PURCHASE', 'Purchase Entry', 'in')
        ON CONFLICT ("RegistrationID", "Code") DO NOTHING`,
       [crypto.randomUUID(), registrationId, crypto.randomUUID()]
     );
@@ -233,12 +241,19 @@ module.exports.register = async (req, res) => {
     // needs different defaults than SALE/PURCHASE above (no stock
     // impact, no tax, not itself a sale). Existing businesses get this
     // same row via migration 032/033's backfill.
+    //
+    // Direction is 'adjustment' only because the column is NOT NULL and
+    // the CHECK from migration 038 allows exactly three values. It is
+    // never read for this type: UpdateStock is false, and both engine
+    // consumers test UpdateStock before they look at Direction. The
+    // Module Configuration form hides the Direction picker when stock
+    // is off for the same reason.
     await client.query(
       `INSERT INTO "TransactionType"
         ("TransactionTypeID", "RegistrationID", "Module", "Code", "Name", "Direction",
          "CalculateTax", "CustomerMandatory", "DiscountAllowed", "PaymentModeRequired",
          "SalesImpact", "UpdateStock")
-       VALUES ($1, $2, 'sales', 'RECEIVE_PAYMENT', 'Receive Payment', 'neutral',
+       VALUES ($1, $2, 'sales', 'RECEIVE_PAYMENT', 'Receive Payment', 'adjustment',
          false, true, false, true, false, false)
        ON CONFLICT ("RegistrationID", "Code") DO NOTHING`,
       [crypto.randomUUID(), registrationId]

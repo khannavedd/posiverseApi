@@ -4,7 +4,7 @@ const { formatTransactionNumber } = require("../Utils/numberingFormat");
 const { publishSaleEvent } = require("../Utils/publishEvent");
 const { publishAfterCommit } = require("../Utils/publishAfterCommit");
 
-// Same shape/purpose as Controllers/Purchase.js's computeItems — looks
+// Same shape/purpose as Controllers/Inventory.js's computeItems — looks
 // up every Tax row referenced by the line items in one go, validates
 // each item, and returns the aggregates the header totals need. Reuses
 // the same tenant-ownership scoping (registrationId) Purchase's version
@@ -182,7 +182,7 @@ function assertTotalMatchesLines({ totalAmount, lineTotalSum, headerDiscount, ad
 }
 
 // Split-payment validation + the same paid/due/status derivation
-// Controllers/Purchase.js's createPurchase already uses for
+// Controllers/Inventory.js's createInventory already uses for
 // paidAmount/dueAmount/paymentStatus — mirrored here rather than
 // extracted into a shared helper, matching how computeItems-style logic
 // is already duplicated once between these two files rather than
@@ -351,7 +351,7 @@ async function insertSaleItems(client, saleId, preparedItems) {
 }
 
 // Creates a Sale header + its SaleItem lines in one transaction — same
-// structure as Controllers/Purchase.js's createPurchase (store
+// structure as Controllers/Inventory.js's createInventory (store
 // ownership check, TransactionType/DocumentSeries numbering, server-side
 // tax computation, commit, then publish for posiverse-engine to apply
 // the InStock deduction asynchronously). One deliberate simplification

@@ -30,7 +30,7 @@ test();
  const TaxRoutes = require("./Routes/Tax");
  const VendorRoutes = require("./Routes/Vendor");
  const CustomerRoutes = require("./Routes/Customer");
- const PurchaseRoutes = require("./Routes/Purchase");
+ const InventoryRoutes = require("./Routes/Inventory");
  const TransactionTypeRoutes = require("./Routes/TransactionType");
  const PaymentTypeRoutes = require("./Routes/PaymentType");
  const PrintTemplateRoutes = require("./Routes/PrintTemplate");
@@ -98,7 +98,7 @@ app.use(
  app.use("/taxes", TaxRoutes);
  app.use("/vendors", VendorRoutes);
  app.use("/customers", CustomerRoutes);
- app.use("/purchases", PurchaseRoutes);
+ app.use("/inventory", InventoryRoutes);
  app.use("/transaction-types", TransactionTypeRoutes);
  app.use("/payment-types", PaymentTypeRoutes);
  app.use("/print-templates", PrintTemplateRoutes);

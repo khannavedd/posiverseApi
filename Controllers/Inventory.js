@@ -1,10 +1,27 @@
+// INVENTORY DOCUMENTS — Purchase Entry today; stock adjustments and
+// transfers once those get entry screens. Which kind a document is
+// comes from its TransactionTypeID, not from a separate controller,
+// exactly as Controllers/Sale.js serves sales, returns and
+// receive-payment (DEC-025, DEC-026).
+//
+// Renamed from Purchase.js. Everything speaks Inventory now: the
+// "Inventory"/"InventoryItem" tables (migration 039), the /inventory
+// routes, the inventory.* permissions (migration 040), the
+// InventoryCreated/InventoryUpdated events, and the `inventory` /
+// `inventories` keys in the JSON responses. Nothing is aliased back to
+// the old names — the mobile app was renamed in lockstep, so a build
+// older than this one will not work against this API. That is
+// intentional; there are no users on an older build.
+//
+// Local variable names still read as "purchase" in places where the
+// document genuinely is one. That is accurate, not a leftover.
 const crypto = require("crypto");
 const pool = require("../DB/postgres");
 const { formatTransactionNumber } = require("../Utils/numberingFormat");
-const { publishPurchaseEvent } = require("../Utils/publishEvent");
+const { publishInventoryEvent } = require("../Utils/publishEvent");
 const { publishAfterCommit } = require("../Utils/publishAfterCommit");
 
-// Shared by createPurchase and updatePurchase — looks up every Tax row
+// Shared by createInventory and updateInventory — looks up every Tax row
 // referenced by the line items in one go (so each item's tax split is
 // computed server-side, not trusted from the client), validates each
 // item, and returns the aggregates both header totals need. Returns
@@ -23,7 +40,7 @@ const { publishAfterCommit } = require("../Utils/publishAfterCommit");
 async function computeItems(client, items, registrationId) {
   // Deliberately NOT filtering IsActive = true here — this check is
   // about tenant ownership (can this business reference this product
-  // at all), not current catalogue visibility. updatePurchase replaces
+  // at all), not current catalogue visibility. updateInventory replaces
   // a purchase's items wholesale, including ones that weren't touched,
   // so requiring every referenced product to still be active would
   // block editing (e.g. just fixing a typo in Notes) any purchase that
@@ -137,11 +154,11 @@ function assertTotalMatchesLines({ totalAmount, lineTotalSum, headerDiscount, ad
 }
 
 // Re-reads a purchase previously created under this idempotency key, in
-// the same shape createPurchase's success response has. Mirrors
+// the same shape createInventory's success response has. Mirrors
 // Controllers/Sale.js's returnExistingSale — see migration 035.
 async function returnExistingPurchase(client, storeId, idempotencyKey) {
   const existing = await client.query(
-    `SELECT * FROM "Purchase" WHERE "StoreID" = $1 AND "IdempotencyKey" = $2`,
+    `SELECT * FROM "Inventory" WHERE "StoreID" = $1 AND "IdempotencyKey" = $2`,
     [storeId, idempotencyKey]
   );
   if (existing.rows.length === 0) return null;
@@ -149,10 +166,10 @@ async function returnExistingPurchase(client, storeId, idempotencyKey) {
   const purchase = existing.rows[0];
   const items = await client.query(
     `SELECT pi.*, pr."Name" AS "ProductName", pr."SKU", pr."Barcode"
-     FROM "PurchaseItem" pi
+     FROM "InventoryItem" pi
      JOIN "Product" pr ON pr."ProductID" = pi."ProductID"
-     WHERE pi."PurchaseID" = $1`,
-    [purchase.PurchaseID]
+     WHERE pi."InventoryID" = $1`,
+    [purchase.InventoryID]
   );
   return { success: true, purchase, items: items.rows };
 }
@@ -160,8 +177,8 @@ async function returnExistingPurchase(client, storeId, idempotencyKey) {
 async function insertPurchaseItems(client, purchaseId, preparedItems) {
   for (const item of preparedItems) {
     await client.query(
-      `INSERT INTO "PurchaseItem"
-        ("PurchaseItemID", "PurchaseID", "ProductID", "Qty", "UnitCost", "MRP", "RetailPrice",
+      `INSERT INTO "InventoryItem"
+        ("InventoryItemID", "InventoryID", "ProductID", "Qty", "UnitCost", "MRP", "RetailPrice",
          "DiscountAmount", "TaxID", "TaxInclusive", "TaxableAmount", "TaxAmount", "TaxComponents",
          "SubTotal", "Notes")
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
@@ -191,9 +208,9 @@ async function insertPurchaseItems(client, purchaseId, preparedItems) {
 // does NOT touch InStock or Vendor.DueAmount here — this endpoint only
 // records the purchase itself. Both of those are downstream effects of
 // "a purchase happened," applied by posiverse-engine's subscribers
-// reacting to the PurchaseCreated event, not computed inline as part
+// reacting to the InventoryCreated event, not computed inline as part
 // of handling this request.
-module.exports.createPurchase = async (req, res) => {
+module.exports.createInventory = async (req, res) => {
   const client = await pool.connect();
   try {
     const {
@@ -332,7 +349,7 @@ module.exports.createPurchase = async (req, res) => {
     // and each line's own Discount amount are two genuinely separate
     // figures, matching how AdditionalCharges/RoundOff already stand
     // alone rather than being folded into some other column.
-    // "Purchase"."DiscountAmount" stores ONLY extraDiscount — the header
+    // "Inventory"."DiscountAmount" stores ONLY extraDiscount — the header
     // field's own value, nothing merged in — while the line-level total
     // is never lost, it's just read back from the PurchaseItem rows
     // themselves (SUM of their own DiscountAmount) whenever it's needed.
@@ -359,7 +376,7 @@ module.exports.createPurchase = async (req, res) => {
     });
     if (totalCheck?.error) {
       await client.query("ROLLBACK");
-      console.error("createPurchase:", totalCheck.error);
+      console.error("createInventory:", totalCheck.error);
       return res.status(500).json({ success: false, message: "Purchase totals didn't balance — nothing was saved." });
     }
 
@@ -368,9 +385,9 @@ module.exports.createPurchase = async (req, res) => {
     const paymentStatus = dueAmount <= 0 ? "paid" : paid > 0 ? "partial" : "unpaid";
 
     const purchaseId = crypto.randomUUID();
-    const purchaseResult = await client.query(
-      `INSERT INTO "Purchase"
-        ("PurchaseID", "StoreID", "VendorID", "TransactionTypeID", "TransactionNo", "TransactionDate",
+    const inventoryResult = await client.query(
+      `INSERT INTO "Inventory"
+        ("InventoryID", "StoreID", "VendorID", "TransactionTypeID", "TransactionNo", "TransactionDate",
          "Status", "RefNo", "Notes", "Subtotal", "DiscountAmount", "TaxAmount", "AdditionalCharges",
          "RoundOff", "TotalAmount", "TotalQty", "PaymentStatus", "DueAmount",
          "Action", "ActionBy", "ActionByUID", "ActionOn", "IdempotencyKey")
@@ -408,7 +425,7 @@ module.exports.createPurchase = async (req, res) => {
     // No Vendor.DueAmount update here, and no InStock write either —
     // this endpoint only records the purchase itself. Both downstream
     // effects are applied by posiverse-engine's subscribers, reacting
-    // to the PurchaseCreated event published below, not computed
+    // to the InventoryCreated event published below, not computed
     // inline as part of handling this request.
     await client.query("COMMIT");
 
@@ -417,15 +434,15 @@ module.exports.createPurchase = async (req, res) => {
     // must not be reported as a failed purchase, because the purchase
     // is already durable at this point.
     const synced = await publishAfterCommit(
-      () => publishPurchaseEvent({
-        eventType: "PurchaseCreated",
-        purchase: purchaseResult.rows[0],
+      () => publishInventoryEvent({
+        eventType: "InventoryCreated",
+        doc: inventoryResult.rows[0],
         items: preparedItems,
       }),
-      `PurchaseCreated ${purchaseResult.rows[0].TransactionNo} (PurchaseID ${purchaseResult.rows[0].PurchaseID})`
+      `InventoryCreated ${inventoryResult.rows[0].TransactionNo} (InventoryID ${inventoryResult.rows[0].InventoryID})`
     );
 
-    return res.json({ success: true, purchase: purchaseResult.rows[0], items: preparedItems, stockSyncPending: !synced });
+    return res.json({ success: true, inventory: inventoryResult.rows[0], items: preparedItems, stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
 
@@ -451,13 +468,13 @@ module.exports.createPurchase = async (req, res) => {
 // add/remove/change, and PurchaseItem rows have no identity outside
 // their parent Purchase anyway). TransactionNo/TransactionTypeID/
 // StoreID never change on edit — this revises a document, it doesn't
-// renumber or relocate it. Like createPurchase, this doesn't touch
+// renumber or relocate it. Like createInventory, this doesn't touch
 // Vendor.DueAmount or InStock itself — it captures the pre-edit
-// purchase + items (below) purely so publishPurchaseEvent can hand
+// purchase + items (below) purely so publishInventoryEvent can hand
 // posiverse-engine's subscribers a real beforeData/afterData diff to
 // work from (e.g. the vendor-due subscriber needs the OLD due amount
 // and vendor to reverse before applying the new one).
-module.exports.updatePurchase = async (req, res) => {
+module.exports.updateInventory = async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
@@ -481,9 +498,9 @@ module.exports.updatePurchase = async (req, res) => {
     await client.query("BEGIN");
 
     const existingResult = await client.query(
-      `SELECT p.* FROM "Purchase" p
+      `SELECT p.* FROM "Inventory" p
        JOIN "Store" s ON s."StoreID" = p."StoreID"
-       WHERE p."PurchaseID" = $1 AND s."RegistrationID" = $2
+       WHERE p."InventoryID" = $1 AND s."RegistrationID" = $2
        FOR UPDATE OF p`,
       [id, req.user.RegistrationID]
     );
@@ -497,7 +514,7 @@ module.exports.updatePurchase = async (req, res) => {
     // this, editing an already-cancelled purchase would republish the
     // ORIGINAL (pre-cancel) item quantities/DueAmount as the new
     // "before" state to posiverse-engine's InStock + vendor-due
-    // consumers, even though cancelPurchase already reversed those
+    // consumers, even though cancelInventory already reversed those
     // effects. That desyncs InStock and Vendor.DueAmount from what the
     // Purchase record actually says, while Status still silently reads
     // 'cancelled'. Caught in review, not user-reported.
@@ -541,7 +558,7 @@ module.exports.updatePurchase = async (req, res) => {
     });
     if (totalCheck?.error) {
       await client.query("ROLLBACK");
-      console.error("updatePurchase:", totalCheck.error);
+      console.error("updateInventory:", totalCheck.error);
       return res.status(500).json({ success: false, message: "Purchase totals didn't balance — nothing was saved." });
     }
 
@@ -550,12 +567,12 @@ module.exports.updatePurchase = async (req, res) => {
     const paymentStatus = newDueAmount <= 0 ? "paid" : paid > 0 ? "partial" : "unpaid";
 
     const updateResult = await client.query(
-      `UPDATE "Purchase"
+      `UPDATE "Inventory"
        SET "VendorID" = $1, "RefNo" = $2, "TransactionDate" = COALESCE($3, "TransactionDate"), "Notes" = $4,
            "Subtotal" = $5, "DiscountAmount" = $6, "TaxAmount" = $7, "AdditionalCharges" = $8, "RoundOff" = $9,
            "TotalAmount" = $10, "TotalQty" = $11, "PaymentStatus" = $12, "DueAmount" = $13,
            "Action" = 'EDIT', "ActionBy" = $14, "ActionByUID" = $15, "ActionOn" = now(), "UpdatedAt" = now()
-       WHERE "PurchaseID" = $16
+       WHERE "InventoryID" = $16
        RETURNING *`,
       [
         vendorId,
@@ -581,7 +598,7 @@ module.exports.updatePurchase = async (req, res) => {
     // hand posiverse-engine's subscribers a real "what changed" diff —
     // this controller doesn't do anything with them itself.
     const oldItemsResult = await client.query(
-      `SELECT * FROM "PurchaseItem" WHERE "PurchaseID" = $1`,
+      `SELECT * FROM "InventoryItem" WHERE "InventoryID" = $1`,
       [id]
     );
     const oldItems = oldItemsResult.rows.map(row => ({
@@ -592,23 +609,23 @@ module.exports.updatePurchase = async (req, res) => {
       retailPrice: row.RetailPrice != null ? Number(row.RetailPrice) : null,
     }));
 
-    await client.query(`DELETE FROM "PurchaseItem" WHERE "PurchaseID" = $1`, [id]);
+    await client.query(`DELETE FROM "InventoryItem" WHERE "InventoryID" = $1`, [id]);
     await insertPurchaseItems(client, id, preparedItems);
 
     await client.query("COMMIT");
 
     const synced = await publishAfterCommit(
-      () => publishPurchaseEvent({
-        eventType: "PurchaseUpdated",
-        purchase: updateResult.rows[0],
+      () => publishInventoryEvent({
+        eventType: "InventoryUpdated",
+        doc: updateResult.rows[0],
         items: preparedItems,
-        beforePurchase: existing,
+        beforeDoc: existing,
         beforeItems: oldItems,
       }),
-      `PurchaseUpdated ${existing.TransactionNo} (PurchaseID ${id})`
+      `InventoryUpdated ${existing.TransactionNo} (InventoryID ${id})`
     );
 
-    return res.json({ success: true, purchase: updateResult.rows[0], items: preparedItems, stockSyncPending: !synced });
+    return res.json({ success: true, inventory: updateResult.rows[0], items: preparedItems, stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -623,9 +640,9 @@ module.exports.updatePurchase = async (req, res) => {
 // and the DueAmount it contributed to the vendor is reversed too (a
 // cancelled purchase means this business no longer owes the vendor for
 // those voided goods — confirmed with the owner rather than assumed).
-// Reuses the exact same before/after-delta mechanism updatePurchase
+// Reuses the exact same before/after-delta mechanism updateInventory
 // (and posiverse-engine's InStock + vendor-due consumers) already
-// have: publish a PurchaseUpdated event whose "after" item list is
+// have: publish a InventoryUpdated event whose "after" item list is
 // empty and whose "after" purchase has DueAmount zeroed. The InStock
 // consumer computes before=this purchase's actual quantities, after=0,
 // and reverses the original addition; the vendor-due consumer computes
@@ -638,7 +655,7 @@ module.exports.updatePurchase = async (req, res) => {
 // in this table) — the frontend shows a "cancelled" pill instead of
 // PaymentStatus once Status is 'cancelled', so this never surfaces as
 // a confusing "PAID" label on a voided purchase.
-module.exports.cancelPurchase = async (req, res) => {
+module.exports.cancelInventory = async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
@@ -646,9 +663,9 @@ module.exports.cancelPurchase = async (req, res) => {
     await client.query("BEGIN");
 
     const existingResult = await client.query(
-      `SELECT p.* FROM "Purchase" p
+      `SELECT p.* FROM "Inventory" p
        JOIN "Store" s ON s."StoreID" = p."StoreID"
-       WHERE p."PurchaseID" = $1 AND s."RegistrationID" = $2
+       WHERE p."InventoryID" = $1 AND s."RegistrationID" = $2
        FOR UPDATE OF p`,
       [id, req.user.RegistrationID]
     );
@@ -663,7 +680,7 @@ module.exports.cancelPurchase = async (req, res) => {
       return res.status(400).json({ success: false, message: "Purchase is already cancelled" });
     }
 
-    const existingItemsResult = await client.query(`SELECT * FROM "PurchaseItem" WHERE "PurchaseID" = $1`, [id]);
+    const existingItemsResult = await client.query(`SELECT * FROM "InventoryItem" WHERE "InventoryID" = $1`, [id]);
     const existingItems = existingItemsResult.rows.map(row => ({
       productId: row.ProductID,
       qty: Number(row.Qty),
@@ -671,10 +688,10 @@ module.exports.cancelPurchase = async (req, res) => {
     }));
 
     const updateResult = await client.query(
-      `UPDATE "Purchase"
+      `UPDATE "Inventory"
        SET "Status" = 'cancelled', "DueAmount" = 0, "PaymentStatus" = 'paid',
            "Action" = 'CANCEL', "ActionBy" = $1, "ActionByUID" = $2, "ActionOn" = now(), "UpdatedAt" = now()
-       WHERE "PurchaseID" = $3
+       WHERE "InventoryID" = $3
        RETURNING *`,
       [req.user.Name || req.user.Email || null, req.user.UserID || null, id]
     );
@@ -682,17 +699,17 @@ module.exports.cancelPurchase = async (req, res) => {
     await client.query("COMMIT");
 
     const synced = await publishAfterCommit(
-      () => publishPurchaseEvent({
-        eventType: "PurchaseUpdated",
-        purchase: updateResult.rows[0],
+      () => publishInventoryEvent({
+        eventType: "InventoryUpdated",
+        doc: updateResult.rows[0],
         items: [],
-        beforePurchase: existing,
+        beforeDoc: existing,
         beforeItems: existingItems,
       }),
-      `PurchaseUpdated (cancel) ${existing.TransactionNo} (PurchaseID ${id})`
+      `InventoryUpdated (cancel) ${existing.TransactionNo} (InventoryID ${id})`
     );
 
-    return res.json({ success: true, purchase: updateResult.rows[0], stockSyncPending: !synced });
+    return res.json({ success: true, inventory: updateResult.rows[0], stockSyncPending: !synced });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -702,7 +719,7 @@ module.exports.cancelPurchase = async (req, res) => {
   }
 };
 
-module.exports.getPurchases = async (req, res) => {
+module.exports.listInventory = async (req, res) => {
   try {
     const { storeId } = req.query;
     const params = [req.user.RegistrationID];
@@ -714,7 +731,7 @@ module.exports.getPurchases = async (req, res) => {
 
     const result = await pool.query(
       `SELECT p.*, v."Name" AS "VendorName"
-       FROM "Purchase" p
+       FROM "Inventory" p
        JOIN "Vendor" v ON v."VendorID" = p."VendorID"
        JOIN "Store" s ON s."StoreID" = p."StoreID"
        WHERE s."RegistrationID" = $1 ${storeFilter}
@@ -722,38 +739,38 @@ module.exports.getPurchases = async (req, res) => {
       params
     );
 
-    return res.json({ success: true, purchases: result.rows });
+    return res.json({ success: true, inventories: result.rows });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ success: false, message: "Error fetching purchases" });
   }
 };
 
-module.exports.getPurchase = async (req, res) => {
+module.exports.getInventory = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const purchaseResult = await pool.query(
+    const inventoryResult = await pool.query(
       `SELECT p.*, v."Name" AS "VendorName"
-       FROM "Purchase" p
+       FROM "Inventory" p
        JOIN "Vendor" v ON v."VendorID" = p."VendorID"
        JOIN "Store" s ON s."StoreID" = p."StoreID"
-       WHERE p."PurchaseID" = $1 AND s."RegistrationID" = $2`,
+       WHERE p."InventoryID" = $1 AND s."RegistrationID" = $2`,
       [id, req.user.RegistrationID]
     );
-    if (purchaseResult.rows.length === 0) {
+    if (inventoryResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Purchase not found" });
     }
 
     const itemsResult = await pool.query(
       `SELECT pi.*, pr."Name" AS "ProductName", pr."SKU", pr."Barcode"
-       FROM "PurchaseItem" pi
+       FROM "InventoryItem" pi
        JOIN "Product" pr ON pr."ProductID" = pi."ProductID"
-       WHERE pi."PurchaseID" = $1`,
+       WHERE pi."InventoryID" = $1`,
       [id]
     );
 
-    return res.json({ success: true, purchase: purchaseResult.rows[0], items: itemsResult.rows });
+    return res.json({ success: true, inventory: inventoryResult.rows[0], items: itemsResult.rows });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ success: false, message: "Error fetching purchase" });
