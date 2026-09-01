@@ -666,6 +666,21 @@ module.exports.updateSale = async (req, res) => {
     }
     const existing = existingResult.rows[0];
 
+    // The type's own rules, on edit as well as create. Without this an
+    // edit could strip a customer from a type that requires one — the
+    // create path checked, the update path never did.
+    if (existing.TransactionTypeID) {
+      const typeCheck = await client.query(
+        `SELECT "Name", "CustomerMandatory" FROM "TransactionType" WHERE "TransactionTypeID" = $1`,
+        [existing.TransactionTypeID]
+      );
+      const ruleError = typeCheck.rows[0] && assertTypeRules(typeCheck.rows[0], { customerId });
+      if (ruleError) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, message: ruleError.error });
+      }
+    }
+
     if (existing.Status === "cancelled") {
       await client.query("ROLLBACK");
       return res.status(400).json({ success: false, message: "Can't edit a cancelled sale" });

@@ -514,7 +514,13 @@ module.exports.updateInventory = async (req, res) => {
       paidAmount,
     } = req.body;
 
-    if (!vendorId) return res.status(400).json({ success: false, message: "vendorId is required" });
+    // vendorId is NOT unconditionally required here — whether this
+    // document needs one is a property of its TransactionType
+    // (VendorMandatory), checked by assertTypeRules below. This line
+    // used to demand it always, which was the create path's old rule
+    // left behind: it made editing any vendorless document impossible
+    // and reported "vendorId is required" for a stock update, which has
+    // no vendor by definition.
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: "At least one item is required" });
     }
@@ -540,7 +546,7 @@ module.exports.updateInventory = async (req, res) => {
     // a figure nobody can verify. Correct it by posting another count.
     if (existing.TransactionTypeID) {
       const typeCheck = await client.query(
-        `SELECT "Kind", "Name" FROM "TransactionType" WHERE "TransactionTypeID" = $1`,
+        `SELECT "Kind", "Name", "VendorMandatory", "CustomerMandatory" FROM "TransactionType" WHERE "TransactionTypeID" = $1`,
         [existing.TransactionTypeID]
       );
       if (typeCheck.rows[0]?.Kind === "stock_update") {
@@ -549,6 +555,15 @@ module.exports.updateInventory = async (req, res) => {
           success: false,
           message: `${typeCheck.rows[0].Name} documents can't be changed once posted — post another one with the correct count.`,
         });
+      }
+
+      // The same rules the create path enforces. An edit that strips a
+      // mandatory vendor is as invalid as a create without one; before
+      // this, only create checked.
+      const ruleError = assertTypeRules(typeCheck.rows[0], { vendorId });
+      if (ruleError) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, message: ruleError.error });
       }
     }
 
@@ -724,7 +739,7 @@ module.exports.cancelInventory = async (req, res) => {
     // a figure nobody can verify. Correct it by posting another count.
     if (existing.TransactionTypeID) {
       const typeCheck = await client.query(
-        `SELECT "Kind", "Name" FROM "TransactionType" WHERE "TransactionTypeID" = $1`,
+        `SELECT "Kind", "Name", "VendorMandatory", "CustomerMandatory" FROM "TransactionType" WHERE "TransactionTypeID" = $1`,
         [existing.TransactionTypeID]
       );
       if (typeCheck.rows[0]?.Kind === "stock_update") {
@@ -733,6 +748,15 @@ module.exports.cancelInventory = async (req, res) => {
           success: false,
           message: `${typeCheck.rows[0].Name} documents can't be changed once posted — post another one with the correct count.`,
         });
+      }
+
+      // The same rules the create path enforces. An edit that strips a
+      // mandatory vendor is as invalid as a create without one; before
+      // this, only create checked.
+      const ruleError = assertTypeRules(typeCheck.rows[0], { vendorId });
+      if (ruleError) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ success: false, message: ruleError.error });
       }
     }
 

@@ -55,7 +55,17 @@ const BLUEPRINTS = [
     kind: "sale_return",
     label: "Sales return",
     description: "Take goods back, refund or credit the customer.",
-    formAvailable: true,
+    // NOT offered in the picker. A sales return is created from a
+    // specific sale's own screen — you pick which sale is coming back —
+    // so it has no drawer entry, and Controllers/Sale.js's
+    // createSaleReturn looks the type up by Code = 'SALE_RETURN'. A
+    // second sale_return type would therefore appear nowhere and never
+    // be used. Every business gets the one it needs from migration 042.
+    //
+    // To offer it properly: give it an entry point that starts by
+    // choosing a sale, and make createSaleReturn take a
+    // transactionTypeId the way createInventory does.
+    formAvailable: false,
     defaults: {
       module: "sales",
       direction: "in",

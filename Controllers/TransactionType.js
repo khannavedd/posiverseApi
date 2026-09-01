@@ -225,7 +225,12 @@ module.exports.updateTransactionType = async (req, res) => {
         flags.calculateTax,
         flags.customerMandatory,
         flags.discountAllowed,
-        Number(discountPercentage) || 0,
+        // Preserved, not defaulted. The app stopped sending this when
+        // the dead controls were removed (DEC-030), and `Number(undefined)
+        // || 0` would silently zero it on every edit. Nothing reads it
+        // today, but wiping stored data because a form dropped a field is
+        // the kind of thing only noticed once it matters.
+        discountPercentage != null ? Number(discountPercentage) || 0 : Number(current.DiscountPercentage) || 0,
         flags.employeeMandatory,
         flags.paymentModeRequired,
         flags.salesImpact,
@@ -273,6 +278,35 @@ module.exports.deleteTransactionType = async (req, res) => {
     );
     const { series_count: seriesCount, purchase_count: purchaseCount, sale_count: saleCount } =
       usageResult.rows[0];
+
+    // The last active type of a kind cannot be deleted. These six kinds
+    // ARE the app's working vocabulary — delete the only 'sale' type and
+    // the business can no longer sell, the POS entry vanishes from the
+    // drawer, and resolveTransactionType's Code = 'SALE' fallback stops
+    // resolving for any older client. Nothing in the app could recover
+    // from that; it would need database access.
+    //
+    // Deactivating is still allowed and is the reversible way to hide
+    // one — createTransactionType revives a soft-deleted row if the
+    // owner re-adds the same code.
+    const target = await pool.query(
+      `SELECT "Kind", "Name" FROM "TransactionType" WHERE "TransactionTypeID" = $1 AND "RegistrationID" = $2`,
+      [id, req.user.RegistrationID]
+    );
+    if (target.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Transaction type not found" });
+    }
+    const siblings = await pool.query(
+      `SELECT COUNT(*)::int AS c FROM "TransactionType"
+       WHERE "RegistrationID" = $1 AND "Kind" = $2 AND "IsActive" = true AND "TransactionTypeID" <> $3`,
+      [req.user.RegistrationID, target.rows[0].Kind, id]
+    );
+    if (siblings.rows[0].c === 0) {
+      return res.status(409).json({
+        success: false,
+        message: `Can't delete — ${target.rows[0].Name} is the only one of its kind, and the app needs it. Create a replacement first.`,
+      });
+    }
 
     const documentCount = purchaseCount + saleCount;
     if (documentCount > 0) {
