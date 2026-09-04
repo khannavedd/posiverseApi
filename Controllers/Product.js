@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const pool = require("../DB/postgres");
+const { uploadImage, deleteImageByUrl } = require("../Utils/imageUpload");
 
 // Catalogue, flat-Product model (migration 019/020, simplified by 021).
 // One row per sellable thing, in the same "Product" table either way:
@@ -692,5 +693,78 @@ module.exports.deleteProduct = async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ success: false, message: "Error deleting product" });
+  }
+};
+
+// ---------------------------------------------------------------------
+// Product image
+//
+// Ownership is verified against RegistrationID BEFORE anything is
+// written to the bucket, so a crafted id cannot make this app store a
+// file on another business's behalf.
+// ---------------------------------------------------------------------
+module.exports.uploadProductImage = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "No image file uploaded (expected field name 'image')." });
+    }
+
+    const existing = await pool.query(
+      `SELECT "ImageURL" FROM "Product" WHERE "ProductID" = $1 AND "RegistrationID" = $2`,
+      [id, req.user.RegistrationID]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    const imageUrl = await uploadImage({
+      file: req.file,
+      prefix: "products",
+      registrationId: req.user.RegistrationID,
+      ownerId: id,
+    });
+
+    await pool.query(
+      `UPDATE "Product" SET "ImageURL" = $1 WHERE "ProductID" = $2 AND "RegistrationID" = $3`,
+      [imageUrl, id, req.user.RegistrationID]
+    );
+
+    // After the row points at the new image, never before — if this
+    // throws, the worst case is an orphaned object, not a row pointing
+    // at a file that no longer exists.
+    await deleteImageByUrl(existing.rows[0].ImageURL);
+
+    return res.json({ success: true, imageUrl });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: "Couldn't upload the image" });
+  }
+};
+
+module.exports.removeProductImage = async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Read then update, deliberately NOT a RETURNING subquery: a
+    // subquery in RETURNING re-reads the table under the statement's
+    // own snapshot, so whether it yields the old or new value is
+    // fragile. Two plain statements say exactly what they mean.
+    const existing = await pool.query(
+      `SELECT "ImageURL" FROM "Product" WHERE "ProductID" = $1 AND "RegistrationID" = $2`,
+      [id, req.user.RegistrationID]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    await pool.query(
+      `UPDATE "Product" SET "ImageURL" = NULL WHERE "ProductID" = $1 AND "RegistrationID" = $2`,
+      [id, req.user.RegistrationID]
+    );
+    await deleteImageByUrl(existing.rows[0].ImageURL);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ success: false, message: "Couldn't remove the image" });
   }
 };
